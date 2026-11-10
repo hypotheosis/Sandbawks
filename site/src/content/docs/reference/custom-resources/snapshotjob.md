@@ -39,6 +39,7 @@ The controller creates these resources and sets `spec.nodeName` and
 | `snapshotRef` | string | No | For `Resume`, the snapshot URL to restore from (typically `s3://...`). Null for `Pause` jobs. |
 | `expectedSha256` | string | No | For `Resume`, the aggregate SHA-256 the controller expects the fetched manifest to match. Null for `Pause` jobs and legacy callers. |
 | `expectedEnvdSha256` | string | No | For `Resume` and `Stage`, the `envd`-binary SHA-256 the controller observed at pause. Null for `Pause` jobs and manifests that recorded no `envd` digest. |
+| `targetPath` | string | No | For `Stage`, the local path on the node to stage the snapshot into. The controller sets it so the restore Pod can be created, with this path, before staging finishes. Null for `Pause` jobs and for `Stage` jobs that let the node choose the path. |
 
 ### Modes
 
@@ -87,6 +88,10 @@ The controller creates these resources and sets `spec.nodeName` and
 | `sha256` | string | Yes | — | Aggregate SHA-256 over the sorted part hashes. Empty when `parts` is empty. |
 | `snapshotRef` | string | No | `""` | Storage URL of the manifest, for example `s3://bucket/key`. |
 | `envdSha256` | string | No | `""` | SHA-256 of the node-staged `envd` binary the paused sandbox was executing. Empty for older manifests or when the staged binary could not be read. |
+| `runscVersion` | string | No | `""` | gVisor `runsc` release the checkpoint was taken with, for example `release-20260525.0`. A restore needs the same release, so the controller places the restore Pod on a node that runs it. Empty for older manifests or when the node couldn't read its `runsc` version. |
+| `envdCaptured` | boolean | No | `false` | `true` when `envd` ran from a copy inside the sandbox's root filesystem at pause time, so its code is part of the checkpoint. The restore then skips the check that the node's `envd` binary matches `envdSha256`. |
+| `templateRef` | string | No | `""` | Reserved for validating clones restored from a snapshot URL. Currently always empty. |
+| `templateImage` | string | No | `""` | Reserved for validating clones restored from a snapshot URL. Currently always empty. |
 | `parts` | array[object] | No | `[]` | Individual parts of the snapshot bundle. See [Manifest parts](#manifest-parts). |
 
 #### Manifest parts

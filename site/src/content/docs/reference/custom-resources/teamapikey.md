@@ -15,6 +15,11 @@ key itself. The full key is shown once at issue time and is not recoverable.
 The 8-character `keyPrefix` is indexed so a lookup is constant time; the
 remainder of the key is then constant-time-compared against `keyHash`.
 
+`TeamAPIKey` resources live in the namespace Sandbawks is installed in, out of
+tenants' reach. The API gateway reads keys only from that namespace and takes the
+tenant namespace from each key's `spec.namespace`, not from the key's own
+`metadata.namespace`. A `TeamAPIKey` created in a tenant namespace isn't used.
+
 ## Resource identity
 
 | Property | Value |
@@ -35,6 +40,7 @@ remainder of the key is then constant-time-compared against `keyHash`.
 |-------|------|----------|-------------|
 | `keyHash` | string | Yes | SHA-256 hex digest of the full key, prefixed `sha256:`. |
 | `keyPrefix` | string | Yes | First 8 characters of the issued key, for example `sbk_a1b2`. |
+| `namespace` | string | Yes | Tenant namespace the key authorizes. Sandboxes created with the key go in this namespace. |
 | `scopes` | array[string] | No | Scope strings. Only `sandboxes:*` is honored; other scopes are reserved. |
 
 ## Additional printer columns
@@ -52,8 +58,9 @@ apiVersion: sandbawks.dev/v1alpha1
 kind: TeamAPIKey
 metadata:
   name: ci-runner
-  namespace: team-acme
+  namespace: sandbawks
 spec:
+  namespace: team-acme
   keyPrefix: sbk_a1b2
   keyHash: sha256:3f786850e387550fdab836ed7e6dc881de23001b...
   scopes:
