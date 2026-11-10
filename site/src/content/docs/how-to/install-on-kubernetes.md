@@ -129,6 +129,9 @@ verified for this guide — confirm them with the
 `node.*` values to match.
 :::
 
+To use AKS Pod Sandboxing (Kata Containers) instead of gVisor, see
+[Run sandboxes on Kata Containers](/how-to/run-sandboxes-on-kata-containers/).
+
 ## k3s
 
 k3s embeds its own containerd, so several paths differ from stock containerd.

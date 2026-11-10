@@ -37,6 +37,7 @@ export default defineConfig({
 						{ label: 'Clone a sandbox', slug: 'how-to/clone-a-sandbox' },
 						{ label: 'Allow sandbox egress', slug: 'how-to/allow-sandbox-egress' },
 						{ label: 'Run sandboxes on a dedicated node pool', slug: 'how-to/run-sandboxes-on-a-dedicated-node-pool' },
+						{ label: 'Run sandboxes on Kata Containers', slug: 'how-to/run-sandboxes-on-kata-containers' },
 					],
 				},
 				{
