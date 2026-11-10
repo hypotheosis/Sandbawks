@@ -217,6 +217,16 @@ containerd-client = "0.8"
 # `rust-s3` already establishes.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 
+# Debuginfo dominates the size of dev/test artifacts: with full debuginfo the
+# instrumented `cargo llvm-cov` build exhausted a GitHub-hosted runner's disk.
+# Line tables keep file:line in backtraces and panics (and coverage, which
+# uses its own instrumentation, not debuginfo); dependencies get none.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
