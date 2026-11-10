@@ -1,0 +1,39 @@
+---
+title: Sandbawks documentation
+description: An E2B-compatible sandbox control plane for Kubernetes — point your existing E2B SDK at your own cluster.
+slug: /
+head:
+  - tag: title
+    content: Sandbawks documentation
+tableOfContents: false
+template: splash
+hero:
+  tagline: An E2B-compatible sandbox control plane for Kubernetes. Point your existing E2B SDK at your own cluster.
+  image:
+    file: ../../assets/sandbawks.png
+    alt: Sandbawks logo
+  actions:
+    - text: Point your agent at Sandbawks
+      link: tutorials/point-your-agent-at-sandbawks/
+      icon: right-arrow
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+The docs are organized in four kinds of page. Start with a tutorial to get
+hands-on; the other three sections grow as the docs do.
+
+<CardGrid>
+	<Card title="Tutorials" icon="open-book">
+		Learn by doing. [Point your agent at Sandbawks](/tutorials/point-your-agent-at-sandbawks/) drives a real sandbox with the standard E2B SDK, end to end.
+	</Card>
+	<Card title="How-to guides" icon="setting">
+		Task-focused recipes — pausing and resuming sandboxes, deploying to a real cluster. Coming soon.
+	</Card>
+	<Card title="Reference" icon="list-format">
+		Authoritative lookup — the E2B API surface and the Sandbawks custom resources. Coming soon.
+	</Card>
+	<Card title="Explanation" icon="information">
+		Background and context — [the Sandbawks components](/explanation/components/) and [how Sandbawks maps the E2B model onto Kubernetes](/explanation/how-sandbawks-maps-e2b-onto-kubernetes/).
+	</Card>
+</CardGrid>
