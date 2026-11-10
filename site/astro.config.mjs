@@ -38,6 +38,7 @@ export default defineConfig({
 						{ label: 'Allow sandbox egress', slug: 'how-to/allow-sandbox-egress' },
 						{ label: 'Run sandboxes on a dedicated node pool', slug: 'how-to/run-sandboxes-on-a-dedicated-node-pool' },
 						{ label: 'Run sandboxes on Kata Containers', slug: 'how-to/run-sandboxes-on-kata-containers' },
+						{ label: 'Store snapshots in Azure Blob Storage', slug: 'how-to/store-snapshots-in-azure-blob-storage' },
 					],
 				},
 				{
