@@ -46,6 +46,7 @@ export default defineConfig({
 					items: [
 						{ label: 'Helm chart', slug: 'reference/helm-chart' },
 						{ label: 'Usage records', slug: 'reference/usage-records' },
+						{ label: 'Events', slug: 'reference/events' },
 						{
 							label: 'Custom resources',
 							items: [
@@ -66,6 +67,7 @@ export default defineConfig({
 						{ label: 'How Sandbawks maps E2B onto Kubernetes', slug: 'explanation/how-sandbawks-maps-e2b-onto-kubernetes' },
 						{ label: 'Multi-namespace tenancy', slug: 'explanation/multi-namespace-tenancy' },
 						{ label: 'Usage metering', slug: 'explanation/usage-metering' },
+						{ label: 'The sandbox lifecycle', slug: 'explanation/sandbox-lifecycle' },
 					],
 				},
 			],
