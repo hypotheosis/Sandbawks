@@ -258,10 +258,13 @@ runtime class and template image. On a mismatch, the sandbox moves to `Failed`
 with a condition. For snapshots written before Sandbawks recorded the template
 image, the image check only logs a warning.
 
-:::note
-A `Snapshot`-mode clone restores the source's guest kernel, including its
-hostname, network interface address, and any `/etc/machine-id`. The controller
-marks such clones so their guest identity can be reset when they start.
+:::caution
+A `Snapshot`-mode clone restores the source's guest kernel, so it keeps the
+source's identity: the kernel hostname (`uname -n`), the network interface's MAC
+and IP address inside the sandbox, and any `/etc/machine-id`. `/etc/hostname`
+reflects the new Pod, so the two disagree. Sandbawks doesn't reset this identity
+yet. Don't rely on hostname or machine ID to tell a clone from its source. A
+`Filesystem`-mode clone starts a fresh Pod and gets a new identity.
 :::
 
 ## Status fields
