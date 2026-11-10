@@ -555,7 +555,12 @@ pub struct FakeSandboxOps {
 
 #[async_trait]
 impl SandboxOps for FakeSandboxOps {
-    async fn create(&self, _ns: &str, mut sandbox: Sandbox) -> Result<Sandbox, AppError> {
+    async fn create(&self, ns: &str, mut sandbox: Sandbox) -> Result<Sandbox, AppError> {
+        // Record the namespace the sandbox was created in, as the apiserver
+        // would, so `get` can resolve it per namespace (issue #13).
+        if sandbox.metadata.namespace.is_none() {
+            sandbox.metadata.namespace = Some(ns.to_owned());
+        }
         // Stamp a creation timestamp if one isn't already set so
         // downstream `sandbox_to_dto` can render a stable `startedAt`.
         if sandbox.metadata.creation_timestamp.is_none() {
@@ -616,12 +621,16 @@ impl SandboxOps for FakeSandboxOps {
         Ok(())
     }
 
-    async fn get(&self, _ns: &str, name: &str) -> Result<Sandbox, AppError> {
+    async fn get(&self, ns: &str, name: &str) -> Result<Sandbox, AppError> {
+        // Names are only unique per namespace (issue #13): match both.
         self.inner
             .lock()
             .await
             .iter()
-            .find(|s| s.metadata.name.as_deref() == Some(name))
+            .find(|s| {
+                s.metadata.name.as_deref() == Some(name)
+                    && s.metadata.namespace.as_deref() == Some(ns)
+            })
             .cloned()
             .ok_or_else(|| AppError::not_found("sandbox_not_found", name.to_owned()))
     }

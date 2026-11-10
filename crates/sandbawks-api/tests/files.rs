@@ -121,3 +121,74 @@ async fn mint_binds_the_url_to_the_callers_namespace() {
     assert_eq!(payload.sandbox_id, "sbx-abc");
     assert_eq!(payload.namespace.as_deref(), Some("team-b"));
 }
+
+/// Signed `/files/download` resolves the sandbox in the namespace the token
+/// was minted for (issue #13). A sandbox that exists only in `team-b`, with no
+/// envd address yet, answers `envd_not_ready` (502) when the token names
+/// `team-b` — proof it was found there — and `sandbox_not_found` (404) for a
+/// token that names another namespace or none (the default, `team-acme`).
+#[tokio::test]
+async fn signed_download_resolves_in_the_tokens_namespace() {
+    use sandbawks_api::signing::{mint, SignedUrlPayload};
+    use sandbawks_types::{ResourceQuantity, ResourceRequests, Sandbox, SandboxSpec};
+
+    let state = AppState::for_test("team-acme", Arc::new(FakeKeyStore::default()));
+    let spec = SandboxSpec {
+        template_ref: "tpl".to_owned(),
+        runtime_class_name: None,
+        resources: ResourceRequests {
+            cpu: "1".parse::<ResourceQuantity>().unwrap(),
+            memory: "512Mi".parse::<ResourceQuantity>().unwrap(),
+            ephemeral_storage: None,
+        },
+        timeout_seconds: 60,
+        auto_pause: false,
+        env: Default::default(),
+        metadata: Default::default(),
+        network_policy: None,
+        desired_phase: None,
+        snapshot_retention: None,
+        pvc_retention: None,
+        tolerations: None,
+        node_selector: None,
+        security_context: None,
+        persistence_mode: None,
+        volume_claim_templates: None,
+        restore_from: None,
+    };
+    state
+        .sandbox_ops()
+        .create("team-b", Sandbox::new("sbx-tenant", spec))
+        .await
+        .unwrap();
+
+    let status = |namespace: Option<&str>| {
+        let state = state.clone();
+        let token = mint(
+            &state.signing_key,
+            &SignedUrlPayload {
+                sandbox_id: "sbx-tenant".into(),
+                path: "/tmp/x".into(),
+                method: "GET".into(),
+                exp: chrono::Utc::now().timestamp() + 60,
+                namespace: namespace.map(str::to_owned),
+            },
+        );
+        async move {
+            files_router(state)
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(format!("/files/download?token={token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    assert_eq!(status(Some("team-b")).await, StatusCode::BAD_GATEWAY);
+    assert_eq!(status(Some("team-c")).await, StatusCode::NOT_FOUND);
+    assert_eq!(status(None).await, StatusCode::NOT_FOUND);
+}

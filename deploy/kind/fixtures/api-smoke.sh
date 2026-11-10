@@ -41,20 +41,33 @@ SMOKE_KEY_HASH="sha256:$(printf '%s' "$SMOKE_API_KEY" | openssl dgst -sha256 -r 
 TEMPLATE_NAME="api-smoke-template"
 TEAM_KEY_NAME="api-smoke-team-key"
 
+# Tenant-namespace case (issue #13): a second key whose spec.namespace is a
+# namespace other than the one the chart runs in. Exercises the envd proxy
+# and the signed /files URLs for a sandbox outside api.defaultNamespace.
+TENANT_NAMESPACE="${SANDBAWKS_API_TENANT_NAMESPACE:-api-smoke-tenant}"
+TENANT_API_KEY="sbk_tenant_tenant_tenant_tenant_t"
+TENANT_KEY_PREFIX="$(printf '%s' "$TENANT_API_KEY" | cut -c1-8)"
+TENANT_KEY_HASH="sha256:$(printf '%s' "$TENANT_API_KEY" | openssl dgst -sha256 -r | awk '{print $1}')"
+
 LOCAL_PAYLOAD="$(mktemp)"
 DOWNLOADED_PAYLOAD="$(mktemp)"
 SANDBOX_ID=""
+TENANT_SANDBOX_ID=""
 
 cleanup() {
     local rc=$?
     if [[ -n "$SANDBOX_ID" ]]; then
         kubectl -n "$NAMESPACE" delete sandbox "$SANDBOX_ID" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     fi
+    if [[ -n "$TENANT_SANDBOX_ID" ]]; then
+        kubectl -n "$TENANT_NAMESPACE" delete sandbox "$TENANT_SANDBOX_ID" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    fi
     rm -f "$LOCAL_PAYLOAD" "$DOWNLOADED_PAYLOAD"
     if (( rc != 0 )); then
         echo "api-smoke: FAILED (exit $rc) — diagnostics follow" >&2
         kubectl -n "$NAMESPACE" get sandbox -o wide >&2 || true
         kubectl -n "$NAMESPACE" get pods -o wide >&2 || true
+        kubectl -n "$TENANT_NAMESPACE" get sandbox,pods -o wide >&2 || true
         kubectl -n "$NAMESPACE" logs deploy/sandbawks-api --tail=80 >&2 || true
         kubectl -n "$NAMESPACE" logs deploy/sandbawks-controller --tail=80 >&2 || true
     fi
@@ -254,4 +267,123 @@ fi
 # Don't double-delete in cleanup() — the CR is gone (or background-deleting).
 SANDBOX_ID=""
 
-echo "api-smoke: SUCCESS — full lifecycle + file round-trip green"
+# ---------------------------------------------------------------------------
+# Tenant namespace (issue #13). The key lives in the system namespace and
+# names TENANT_NAMESPACE in spec.namespace, so its sandboxes live there, not in
+# the gateway's default namespace. Before #13 every envd-proxied call and
+# signed /files URL for such a sandbox answered sandbox_not_found.
+# ---------------------------------------------------------------------------
+echo "api-smoke: tenant namespace ${TENANT_NAMESPACE}: applying fixtures"
+kubectl create namespace "$TENANT_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f - <<EOF
+apiVersion: sandbawks.dev/v1alpha1
+kind: SandboxTemplate
+metadata:
+  name: ${TEMPLATE_NAME}
+  namespace: ${TENANT_NAMESPACE}
+spec:
+  image: docker.io/library/debian:12-slim
+  defaultRuntimeClass: gvisor
+  defaultResources:
+    cpu: "100m"
+    memory: "64Mi"
+    ephemeralStorage: "256Mi"
+  defaultTimeoutSeconds: 300
+---
+apiVersion: sandbawks.dev/v1alpha1
+kind: TeamAPIKey
+metadata:
+  name: api-smoke-tenant-key
+  namespace: ${NAMESPACE}
+spec:
+  namespace: "${TENANT_NAMESPACE}"
+  keyPrefix: "${TENANT_KEY_PREFIX}"
+  keyHash: "${TENANT_KEY_HASH}"
+  scopes:
+    - "sandboxes:*"
+EOF
+
+TENANT_SA="system:serviceaccount:${TENANT_NAMESPACE}:sandbawks-tenant"
+echo "api-smoke: waiting up to 60s for tenant RBAC (${TENANT_SA})"
+rbac_ready=""
+for attempt in $(seq 1 60); do
+    if kubectl auth can-i create sandboxes.sandbawks.dev \
+        -n "${TENANT_NAMESPACE}" --as="${TENANT_SA}" >/dev/null 2>&1; then
+        rbac_ready=1
+        break
+    fi
+    sleep 1
+done
+if [ -z "${rbac_ready}" ]; then
+    echo "api-smoke: FAILED — tenant RBAC for ${TENANT_SA} not provisioned within 60s" >&2
+    exit 1
+fi
+
+echo "api-smoke: tenant POST /sandboxes"
+TENANT_CREATE_RESP="$(curl -fsS -X POST "$API_BASE/sandboxes" \
+    -H "X-API-Key: $TENANT_API_KEY" \
+    -H 'Content-Type: application/json' \
+    -d "{\"templateID\":\"${TEMPLATE_NAME}\",\"timeout\":300}")"
+TENANT_SANDBOX_ID="$(printf '%s' "$TENANT_CREATE_RESP" | jq -er '.sandboxID')"
+TENANT_TOKEN="$(printf '%s' "$TENANT_CREATE_RESP" | jq -er '.envdAccessToken')"
+echo "api-smoke: created tenant sandbox ${TENANT_SANDBOX_ID}"
+if [[ "$TENANT_TOKEN" != "${TENANT_NAMESPACE}."* ]]; then
+    echo "api-smoke: envdAccessToken is not bound to ${TENANT_NAMESPACE}" >&2
+    exit 1
+fi
+
+echo "api-smoke: waiting up to 60s for the tenant sandbox's status.envdAddress"
+ENVD_ADDR=""
+for attempt in $(seq 1 60); do
+    ENVD_ADDR="$(kubectl -n "$TENANT_NAMESPACE" get sandbox "$TENANT_SANDBOX_ID" \
+        -o jsonpath='{.status.envdAddress}' 2>/dev/null || true)"
+    [[ -n "$ENVD_ADDR" ]] && break
+    sleep 1
+done
+if [[ -z "$ENVD_ADDR" ]]; then
+    echo "api-smoke: tenant envdAddress never populated within 60s" >&2
+    exit 1
+fi
+
+echo "api-smoke: tenant GET /health through the envd proxy"
+HEALTH_STATUS="$(curl -sS -o /dev/null -w '%{http_code}' "$API_BASE/health" \
+    -H "E2b-Sandbox-Id: ${TENANT_SANDBOX_ID}" \
+    -H "X-Access-Token: ${TENANT_TOKEN}")"
+if [[ "$HEALTH_STATUS" != "200" ]]; then
+    echo "api-smoke: tenant envd /health returned HTTP ${HEALTH_STATUS}, expected 200" >&2
+    exit 1
+fi
+
+echo "api-smoke: tenant signed-URL file round-trip"
+MINT_PUT_RESP="$(curl -fsS -X POST "$API_BASE/files/mint" \
+    -H "X-API-Key: $TENANT_API_KEY" \
+    -H 'Content-Type: application/json' \
+    -d "{\"sandbox_id\":\"${TENANT_SANDBOX_ID}\",\"path\":\"/tmp/tenant.bin\",\"method\":\"PUT\",\"ttl\":300}")"
+UPLOAD_STATUS="$(curl -fsS -o /dev/null -w '%{http_code}' \
+    -X PUT --data-binary "@${LOCAL_PAYLOAD}" \
+    "${API_BASE}$(printf '%s' "$MINT_PUT_RESP" | jq -er '.url')")"
+if [[ "$UPLOAD_STATUS" != "204" ]]; then
+    echo "api-smoke: tenant upload returned HTTP ${UPLOAD_STATUS}, expected 204" >&2
+    exit 1
+fi
+MINT_GET_RESP="$(curl -fsS -X POST "$API_BASE/files/mint" \
+    -H "X-API-Key: $TENANT_API_KEY" \
+    -H 'Content-Type: application/json' \
+    -d "{\"sandbox_id\":\"${TENANT_SANDBOX_ID}\",\"path\":\"/tmp/tenant.bin\",\"method\":\"GET\",\"ttl\":300}")"
+curl -fsS -o "$DOWNLOADED_PAYLOAD" "${API_BASE}$(printf '%s' "$MINT_GET_RESP" | jq -er '.url')"
+if ! cmp -s "$LOCAL_PAYLOAD" "$DOWNLOADED_PAYLOAD"; then
+    echo "api-smoke: tenant downloaded payload differs from local source" >&2
+    exit 1
+fi
+
+echo "api-smoke: tenant POST /sandboxes/${TENANT_SANDBOX_ID}/kill"
+KILL_STATUS="$(curl -fsS -o /dev/null -w '%{http_code}' \
+    -X POST "$API_BASE/sandboxes/${TENANT_SANDBOX_ID}/kill" \
+    -H "X-API-Key: $TENANT_API_KEY")"
+if [[ "$KILL_STATUS" != "204" ]]; then
+    echo "api-smoke: tenant kill returned HTTP ${KILL_STATUS}, expected 204" >&2
+    exit 1
+fi
+TENANT_SANDBOX_ID=""
+
+echo "api-smoke: SUCCESS — full lifecycle + file round-trip green (default and tenant namespace)"

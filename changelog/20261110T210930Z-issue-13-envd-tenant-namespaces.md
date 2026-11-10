@@ -63,3 +63,27 @@ cluster-wide `sandboxes: get/list/watch` and `sandboxes/status: patch`.
 - Existing signature tests and the real-SDK vectors now use the legacy token
   explicitly. The SDK treats the token as opaque, so the vectors still pin
   the signature format.
+
+## Follow-up from the claims audit
+
+- `FakeSandboxOps` now records the namespace a sandbox is created in and
+  matches it on `get`, so tests can tell namespaces apart.
+- New `tests/files.rs::signed_download_resolves_in_the_tokens_namespace`: a
+  signed download minted for `team-b` finds a team-b-only sandbox (502
+  `envd_not_ready`), while one minted for another namespace, or with none,
+  gets 404.
+- `deploy/kind/fixtures/api-smoke.sh` gains a tenant-namespace case. A second
+  `TeamAPIKey` names a separate namespace (`SANDBAWKS_API_TENANT_NAMESPACE`,
+  default `api-smoke-tenant`). The case asserts the `envdAccessToken` is bound
+  to it, envd `/health` through the proxy returns 200, a signed-URL
+  upload/download round-trips, and kill works.
+
+## End-to-end
+
+Run on a fresh kind cluster (gVisor mode, images built from this branch):
+
+- With the E2B Python SDK and a key whose `spec.namespace` is `team-b`,
+  `Sandbox.create` returned a `team-b.`-prefixed token. `files.write` then
+  `files.read` round-tripped, `commands.run` exited 0, and the sandbox's
+  `lastActivityTimestamp` was stamped in `team-b`.
+- The updated `api-smoke.sh` passed, default and tenant namespace.
