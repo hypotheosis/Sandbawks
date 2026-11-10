@@ -253,10 +253,10 @@ How the controller restores depends on the new sandbox's effective
   starts on the cloned volumes. The source must be suspended (paused in
   `Filesystem` mode).
 
-Before restoring, the controller checks the source against the new sandbox's
-runtime class and template image. On a mismatch, the sandbox moves to `Failed`
-with a condition. For snapshots written before Sandbawks recorded the template
-image, the image check only logs a warning.
+Before restoring, the controller checks that the source and the new sandbox use
+the same runtime class and, in `Snapshot` mode, the same template image. It reads
+both from the sandboxes' templates as they are when the clone is created. On a
+mismatch, the sandbox moves to `Failed` with a condition.
 
 :::caution
 A `Snapshot`-mode clone restores the source's guest kernel, so it keeps the

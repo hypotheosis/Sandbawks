@@ -90,8 +90,8 @@ The controller creates these resources and sets `spec.nodeName` and
 | `envdSha256` | string | No | `""` | SHA-256 of the node-staged `envd` binary the paused sandbox was executing. Empty for older manifests or when the staged binary could not be read. |
 | `runscVersion` | string | No | `""` | gVisor `runsc` release the checkpoint was taken with, for example `release-20260525.0`. A restore needs the same release, so the controller places the restore Pod on a node that runs it. Empty for older manifests or when the node couldn't read its `runsc` version. |
 | `envdCaptured` | boolean | No | `false` | `true` when `envd` ran from a copy inside the sandbox's root filesystem at pause time, so its code is part of the checkpoint. The restore then skips the check that the node's `envd` binary matches `envdSha256`. |
-| `templateRef` | string | No | `""` | `SandboxTemplate` the paused sandbox was created from. Used to validate a clone (`Sandbox.spec.restoreFrom`). |
-| `templateImage` | string | No | `""` | Template image the paused sandbox ran. A clone whose template image differs is rejected. Empty for older manifests, in which case the image check only logs a warning. |
+| `templateRef` | string | No | `""` | Reserved for validating clones restored from a snapshot URL. Currently always empty. |
+| `templateImage` | string | No | `""` | Reserved for validating clones restored from a snapshot URL. Currently always empty. |
 | `parts` | array[object] | No | `[]` | Individual parts of the snapshot bundle. See [Manifest parts](#manifest-parts). |
 
 #### Manifest parts
