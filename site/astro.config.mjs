@@ -45,6 +45,7 @@ export default defineConfig({
 					label: 'Reference',
 					items: [
 						{ label: 'Helm chart', slug: 'reference/helm-chart' },
+						{ label: 'E2B API', slug: 'reference/e2b-api' },
 						{ label: 'Usage records', slug: 'reference/usage-records' },
 						{ label: 'Events', slug: 'reference/events' },
 						{
