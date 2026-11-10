@@ -43,7 +43,31 @@ reassignment, not a Pod creation or restore.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `ready` | integer (`uint32`) | `0` | Number of sandboxes in the pool currently `Running` and ready for handoff. |
+| `failed` | integer (`uint32`) | `0` | Members seen in `Failed` or `Terminating` during the last reconcile. The controller deletes these on every pass, so a value that stays above zero means members keep failing after they're created. |
+| `total` | integer (`uint32`) | `0` | All members seen during the last reconcile, in any phase. `maxReady` bounds only `ready`, so `total` can exceed `maxReady`; a large `total` points to leaked members. |
 | `members` | array[string] | — | Names of the `Running` members currently ready to claim. |
+| `consecutiveMintFailures` | integer (`uint32`) | `0` | Number of consecutive reconciles that found failed members. Reset to `0` by a reconcile that finds none. |
+| `degraded` | boolean | `false` | `true` while the mint-failure circuit breaker is open and the pool creates no new members. See [Mint-failure circuit breaker](#mint-failure-circuit-breaker). |
+| `degradedReason` | string | — | The main failure message from the failed members when the breaker opened. Null while the breaker is closed. |
+| `backoffUntil` | string (RFC 3339) | — | Time until which the breaker blocks new members. After it passes, the pool creates one probe member. Null while the breaker is closed. |
+| `backoffCount` | integer (`uint32`) | `0` | Number of failed probes since the breaker opened. Each one doubles the backoff. Reset to `0` when the breaker closes. |
+
+### Mint-failure circuit breaker
+
+When members keep failing right after they are created, for example because an
+admission webhook rejects their Pods, the pool stops creating new members instead
+of replacing them in a loop:
+
+1. When `consecutiveMintFailures` reaches 5, the breaker opens: `degraded` becomes
+   `true` and the pool creates no members until `backoffUntil`.
+2. After the backoff, the pool creates one probe member. If the probe fails, the
+   breaker reopens and `backoffCount` increases.
+3. The first backoff is 30 seconds, and it doubles with each failed probe, up to
+   15 minutes.
+4. A reconcile that finds no failed members closes the breaker and resets the
+   counters.
+
+These values are fixed in the controller; they aren't Helm values.
 
 ## Additional printer columns
 
@@ -55,6 +79,8 @@ These columns appear in `kubectl get sandboxwarmpools` output.
 | `Min` | `.spec.minReady` |
 | `Max` | `.spec.maxReady` |
 | `Ready` | `.status.ready` |
+| `Failed` | `.status.failed` |
+| `Total` | `.status.total` |
 
 ## Example
 
@@ -73,4 +99,4 @@ spec:
 ## See also
 
 - [SandboxTemplate](/reference/custom-resources/sandboxtemplate/) — defines the pool members.
-- [Sandbox](/reference/custom-resources/sandbox/) — the resource the pool holds ready to claim.
+- [Sandbox](/reference/custom-resources/sandbox/) — the resource the pool holds ready to claim. Warm-pool members are named `sbx-<pool-name>-<suffix>`, and their `Claimed` printer column shows when each was claimed.
