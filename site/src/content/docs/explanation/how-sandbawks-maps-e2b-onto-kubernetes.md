@@ -162,9 +162,12 @@ thread pool or a pre-forked server, applied to whole sandboxes.
 Finally, multi-tenancy. Sandbawks equates a **team** with a **Kubernetes
 namespace**, and a [`TeamAPIKey`](/reference/custom-resources/teamapikey/) is what
 ties an incoming API key to one. When a request arrives at the gateway, the key it
-carries selects the namespace its sandboxes live in, and the namespace boundary
-then does the heavy lifting of isolation that Kubernetes already knows how to
-enforce.
+carries selects the namespace its sandboxes live in, and the gateway acts in that
+namespace as a per-tenant ServiceAccount, so the namespace boundary does the heavy
+lifting of isolation that Kubernetes already knows how to enforce. The keys
+themselves live in Sandbawks' own namespace, out of tenants' reach;
+[Multi-namespace tenancy](/explanation/multi-namespace-tenancy/) explains the
+details.
 
 A detail worth dwelling on: the `TeamAPIKey` stores only a hash of the key, never
 the key itself, and the full key is shown exactly once when it is issued. This is
