@@ -1,14 +1,14 @@
 {
   "schema_version": 2,
-  "next_claim_seq": 189,
+  "next_claim_seq": 204,
   "next_claim_seq_seal": {
     "by": "server",
-    "mac": "f4df03805bbe504ec33c967de0a4502a83d66a3c08d53108531719271fbe107e"
+    "mac": "f1efeb0c9551c700e0941eb4caa7b6b0a0e23c955753551bca9977a191bdc28c"
   },
-  "next_evidence_seq": 230,
+  "next_evidence_seq": 263,
   "next_evidence_seq_seal": {
     "by": "server",
-    "mac": "291840436e14ea8ff163f1c270f230f2262fe6df9874a6b1386af0613e329a25"
+    "mac": "82447b44ee804c59f23aeba1c52c5001c21a85bce08a39ee80aacfbfbdb9a5f2"
   },
   "claims": [
     {
@@ -4816,6 +4816,50 @@
             "by": "server",
             "mac": "4c5d02602d5d20a8f8b3ca186c9f51f0104aa6ceb8295863a780486e8f924fa5"
           }
+        },
+        {
+          "id": "EVD-0254",
+          "kind": "inspection",
+          "locator": "crates/sandbawks-api/src/routes/envd_proxy.rs:222-260,371-390 at bb5a2c8",
+          "summary": "Re-audit after #13. authorize() now requires a valid X-Access-Token or file signature before lookup (a bare sandbox id is no longer enough; the old refutation reason about the bare id was already stale after #683). The sandbox is resolved in the namespace bound into the credential, not state.default_namespace, so tenant namespaces resolve. The caller is identified by possession of the sandbox's token, not by a TeamContext/API key; the namespace is the one the token was issued for, which equals the team namespace for the team that created the sandbox.",
+          "stance": "neutral",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/src/routes/envd_proxy.rs",
+              "lines": {
+                "start": 222,
+                "end": 260
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:15:45.404746263Z",
+          "seal": {
+            "by": "server",
+            "mac": "99a746863b24a41c83942ab009ec61e8ea6c7b6177ecddf2234d280d19ee0092"
+          }
+        },
+        {
+          "id": "EVD-0255",
+          "kind": "test",
+          "locator": "tests/envd_proxy.rs::tenant_namespace_token_resolves_in_its_namespace, token_does_not_reach_the_same_id_in_another_namespace, relabelled_token_returns_401",
+          "summary": "Passed. Tenant-namespace tokens resolve in their namespace, a token for one namespace does not reach the same id in another, and a relabelled token gets 401. Together with the unauthenticated-without-token 401 tests, these show the proxy no longer resolves by bare id nor in the default namespace only.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/tests/envd_proxy.rs",
+              "lines": {
+                "start": 494,
+                "end": 537
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:15:45.424435557Z",
+          "seal": {
+            "by": "server",
+            "mac": "de6faf870d6238ebdd5979ad43e3a85d15e1af480ec9a953dbab5c3ff680f918"
+          }
         }
       ],
       "verdicts": [
@@ -4831,13 +4875,26 @@
             "by": "server",
             "mac": "011dc4c5be594648cb40865fb4cc5fcaa9c1aefc0e81cb72837680af2e92a891"
           }
+        },
+        {
+          "verdict": "supported",
+          "rationale": "Re-audit at bb5a2c8: the earlier refutation (bare id as the only credential, default namespace only) no longer holds. Tests show 401 without or with a wrong token, and tenant-namespace resolution bound to a credential. Caveat: \"caller\" is identified by the sandbox's bearer token (E2B model), not by a team API key.",
+          "auditor": "claude-sonnet-5-5",
+          "evidence_ids": [
+            "EVD-0255"
+          ],
+          "recorded_at": "2026-11-10T21:16:19.316912856Z",
+          "seal": {
+            "by": "server",
+            "mac": "f46de4352e6e4a2aa17775b9a6671591167760b4e34ddd03e57df2d520c9fa38"
+          }
         }
       ],
       "created_at": "2026-10-29T11:55:27.607244627Z",
-      "updated_at": "2026-10-29T12:08:54.410354363Z",
+      "updated_at": "2026-11-10T21:16:19.316912856Z",
       "seal": {
         "by": "server",
-        "mac": "8abb3e1d4915d02eb49b1ff3384b280b376fb2583394b662845784540609b6f0"
+        "mac": "7122def67220a915eb17d57e8d99c35818cb90c4d14bd71d4b004ad2ab9ce082"
       }
     },
     {
@@ -11278,6 +11335,1368 @@
       "seal": {
         "by": "server",
         "mac": "1127ac210d312ba16bc75fc996051e9e7f9edaece8b0893c3085f1f016bae336"
+      }
+    },
+    {
+      "id": "CLM-0189",
+      "statement": "After this change, envd-proxied data-plane calls (files, commands, PTY) for a sandbox outside api.defaultNamespace resolve instead of answering sandbox_not_found.",
+      "kind": "functional",
+      "level": "software",
+      "integrity_level": 3,
+      "verification_method": "test",
+      "source": "https://github.com/hypotheosis/Sandbawks/issues/13 (envd proxy only finds sandboxes in the gateway's default namespace)",
+      "derived_from": [],
+      "artifacts": [
+        "crates/sandbawks-api/src/routes/envd_proxy.rs",
+        "crates/sandbawks-api/src/envd_cache.rs",
+        "crates/sandbawks-api/src/state.rs"
+      ],
+      "tags": [
+        "from-issue:13"
+      ],
+      "status": {
+        "state": "active"
+      },
+      "evidence": [
+        {
+          "id": "EVD-0234",
+          "kind": "test",
+          "locator": "tests/envd_proxy.rs::tenant_namespace_token_resolves_in_its_namespace",
+          "summary": "Proxy-level test reaches a sandbox in a non-default namespace (403 paused, not 404). Limits: Tests cover the unary router /health only with an in-memory cache and a fake sandbox_ops; no real cluster, no files/commands/PTY end-to-end (issue not reproduced on a cluster either). The envd_proxy.rs classification path is shared by all routes (classify_sandbox).",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/tests/envd_proxy.rs",
+              "lines": {
+                "start": 494,
+                "end": 510
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:14:23.422722091Z",
+          "seal": {
+            "by": "server",
+            "mac": "2f5c1c07e9dedfcc3092234d38c5ed69c65fb4e2c04c2b45d0b3132ee8b362ca"
+          }
+        },
+        {
+          "id": "EVD-0256",
+          "kind": "analysis",
+          "locator": "children of CLM-0189",
+          "summary": "12 of 14 children are supported: the all-namespace watch, namespace-bound tokens (4 security/interface claims), namespace-keyed cache, proxy lookup, signature candidates, activity stamping, DTO token, unchanged RBAC and the cargo run. Two are open: CLM-0198 (not_enough_info, upload/download handlers untested) and CLM-0203 (refuted, advisory: no kind-smoke case for a non-release tenant namespace). In-process tests cover the proxy path; nothing was run on a cluster.",
+          "stance": "neutral",
+          "recorded_at": "2026-11-10T21:16:28.912233671Z",
+          "seal": {
+            "by": "server",
+            "mac": "a69a7670388c54eb130af86b43d1a46fc252a01f1dbac8eaebfecc8309351257"
+          }
+        },
+        {
+          "id": "EVD-0262",
+          "kind": "demonstration",
+          "locator": "live kind cluster sandbawks-i13: api-smoke.sh (tenant case); manual curl with tenant sandbox sbx-cc120b05984f",
+          "summary": "Reproduced on a real cluster by me: in namespace api-smoke-tenant (not the release namespace default) the envdAccessToken is prefixed api-smoke-tenant., proxy /health returns 200, GET /files through the proxy returns 200 and stamps lastActivityTimestamp there, signed upload (204) and download round-trip, and the same token without its namespace prefix returns 401. Not reproduced by me: PTY, and the SDK-level files.write, files.read and commands.run (producer-reported in the changelog \"End-to-end\" section; the Python SDK run was not repeated). Producer-reported SDK run is consistent with what I saw, namely team-b sandboxes Running with stamps.",
+          "stance": "supports",
+          "recorded_at": "2026-11-10T21:25:59.320459269Z",
+          "seal": {
+            "by": "server",
+            "mac": "4f99671d0d506d51c63d8e948a23f57aee795d7208e3b90a8bb0e4e73a2ba828"
+          }
+        }
+      ],
+      "verdicts": [
+        {
+          "verdict": "not_enough_info",
+          "rationale": "The proxy path is verified in-process (tenant-namespace token resolves, cross-namespace does not, watch is all-namespace), but the end-to-end claim for files, commands and PTY on a real cluster is undecided: the upload/download handlers are untested for namespace resolution and no smoke case with a non-release tenant namespace exists. Fix: add a kind-smoke case (TeamAPIKey with spec.namespace different from the release namespace, files.write then files.read and commands.run) and an integration test for upload/download namespace resolution, or run the PR's manual test plan on a cluster and record the result.",
+          "auditor": "claude-sonnet-5-5",
+          "evidence_ids": [],
+          "recorded_at": "2026-11-10T21:16:32.709848718Z",
+          "seal": {
+            "by": "server",
+            "mac": "aa51d22c10c988ef92c7c5f4b14a9f656365314f1f4543a21879878e85a1c4fc"
+          }
+        },
+        {
+          "verdict": "supported",
+          "rationale": "I reproduced the issue's scenario on a real cluster: proxied /files, signed upload/download and namespace-bound tokens work in a non-release tenant namespace, where before they answered sandbox_not_found. Commands and PTY share the same classify_sandbox path but I did not run them or the SDK myself; that part is producer-reported and consistent with what I observed.",
+          "auditor": "claude-sonnet-5-5",
+          "evidence_ids": [
+            "EVD-0234",
+            "EVD-0262"
+          ],
+          "recorded_at": "2026-11-10T21:26:11.572453378Z",
+          "seal": {
+            "by": "server",
+            "mac": "c3f002e6328063484d15a54eb03bf9ab949b7450b915d01d1fa7b97d0c2530b2"
+          }
+        }
+      ],
+      "created_at": "2026-11-10T21:13:45.385396122Z",
+      "updated_at": "2026-11-10T21:26:11.572453378Z",
+      "seal": {
+        "by": "server",
+        "mac": "88a618a2c442c1c08090ced5e36e7755618e7b3f9499b8953d0afe28b112c590"
+      }
+    },
+    {
+      "id": "CLM-0190",
+      "statement": "The EnvdCache watch is created with Api::<Sandbox>::all, so it covers every namespace, not just the default namespace.",
+      "kind": "functional",
+      "level": "unit",
+      "integrity_level": 3,
+      "verification_method": "analysis",
+      "source": "Issue #13 possible fix: \"Run the cache watch with Api::all\"; PR body: \"watches Api::all\"",
+      "derived_from": [
+        "CLM-0189"
+      ],
+      "artifacts": [
+        "crates/sandbawks-api/src/state.rs"
+      ],
+      "tags": [
+        "from-issue:13"
+      ],
+      "status": {
+        "state": "active"
+      },
+      "evidence": [
+        {
+          "id": "EVD-0230",
+          "kind": "inspection",
+          "locator": "crates/sandbawks-api/src/state.rs:143",
+          "summary": "from_kube builds EnvdCache::spawn(Api::<Sandbox>::all(kube.clone())); the old Api::namespaced(.., &default_namespace) is gone.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/src/state.rs",
+              "lines": {
+                "start": 137,
+                "end": 143
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:14:23.338795562Z",
+          "seal": {
+            "by": "server",
+            "mac": "7cee8258bf7e6681012bb8c9ea786013685953c0b449e67f8941317c25a59ba1"
+          }
+        },
+        {
+          "id": "EVD-0231",
+          "kind": "analysis",
+          "locator": "git grep -E 'Api::<Sandbox>::namespaced' crates/sandbawks-api/src (0 hits expected for EnvdCache::spawn)",
+          "summary": "No namespaced Sandbox Api feeds EnvdCache::spawn anywhere in sandbawks-api/src.",
+          "stance": "supports",
+          "anchor": {
+            "search": {
+              "pattern": "EnvdCache::spawn\\(Api::<Sandbox>::namespaced",
+              "scope": [
+                "crates/sandbawks-api/src"
+              ],
+              "hits": 0,
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:14:23.359303177Z",
+          "seal": {
+            "by": "server",
+            "mac": "82813e38dafff18464ef31e31d796a9e7f8c7db601cf2f3b8f8a1dfe31eccdb6"
+          }
+        }
+      ],
+      "verdicts": [
+        {
+          "verdict": "supported",
+          "rationale": "state.rs:143 builds the watch with Api::all and a zero-hit search shows no namespaced Api feeds EnvdCache::spawn.",
+          "auditor": "claude-sonnet-5-5",
+          "evidence_ids": [
+            "EVD-0230",
+            "EVD-0231"
+          ],
+          "recorded_at": "2026-11-10T21:16:19.048390091Z",
+          "seal": {
+            "by": "server",
+            "mac": "54bbcb64621d9e0e4e7f1024a8af14659d83cc72d1ac070033c2b508faa574cb"
+          }
+        }
+      ],
+      "created_at": "2026-11-10T21:13:45.385396122Z",
+      "updated_at": "2026-11-10T21:16:19.048390091Z",
+      "seal": {
+        "by": "server",
+        "mac": "b54c08b1c3299e1901c19326afbe3118262cc6acd1a4b6907f7ca2a3ea02f3f5"
+      }
+    },
+    {
+      "id": "CLM-0191",
+      "statement": "The proxy resolves the sandbox in the namespace carried by a verified envd access token, for both the cache lookup and the apiserver fallback get, rather than in state.default_namespace.",
+      "kind": "functional",
+      "level": "unit",
+      "integrity_level": 3,
+      "verification_method": "test",
+      "source": "PR body: \"authorize returns the namespace, and a SandboxRef { namespace, id } drives the lookup, the not-ready park, activity stamps and stream activity.\"",
+      "derived_from": [
+        "CLM-0189"
+      ],
+      "artifacts": [
+        "crates/sandbawks-api/src/routes/envd_proxy.rs"
+      ],
+      "tags": [
+        "from-issue:13"
+      ],
+      "status": {
+        "state": "active"
+      },
+      "evidence": [
+        {
+          "id": "EVD-0232",
+          "kind": "inspection",
+          "locator": "crates/sandbawks-api/src/routes/envd_proxy.rs:371-390",
+          "summary": "classify_sandbox takes the namespace from authorize(), builds SandboxRef{namespace,id}, then calls envd_cache.lookup(&ns,&id) and on miss sandbox_ops().get(&ns,&id); no default_namespace in that path (default_namespace appears only in authorize at lines 233 and 251 for legacy tokens).",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/src/routes/envd_proxy.rs",
+              "lines": {
+                "start": 371,
+                "end": 390
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:14:23.380132334Z",
+          "seal": {
+            "by": "server",
+            "mac": "11a23a0b8649ee8c65f551a04f2a038bfc8d60e42ba1e4624c5fb27a5e118326"
+          }
+        },
+        {
+          "id": "EVD-0233",
+          "kind": "test",
+          "locator": "cargo test --workspace --all-targets; tests/envd_proxy.rs::tenant_namespace_token_resolves_in_its_namespace (lines 497-510)",
+          "summary": "Passed. A paused sandbox cached only in team-b (gateway default is team-acme) with a team-b token answers 403 sandbox_paused, i.e. it was resolved in team-b; the assertion is on StatusCode::FORBIDDEN, which cannot occur via a default-namespace lookup (404).",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/tests/envd_proxy.rs",
+              "lines": {
+                "start": 494,
+                "end": 510
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:14:23.399921786Z",
+          "seal": {
+            "by": "server",
+            "mac": "47a44c8dc30e3eb2908b263fc460359320c36aae96bcecea19571353d1efb762"
+          }
+        }
+      ],
+      "verdicts": [
+        {
+          "verdict": "supported",
+          "rationale": "classify_sandbox uses the authorised namespace for cache and apiserver lookups, and a passing test shows a non-default-namespace sandbox resolving (403 paused rather than 404).",
+          "auditor": "claude-sonnet-5-5",
+          "evidence_ids": [
+            "EVD-0232",
+            "EVD-0233"
+          ],
+          "recorded_at": "2026-11-10T21:16:19.118219832Z",
+          "seal": {
+            "by": "server",
+            "mac": "ed2520788dc40db4a7e5b25639e1b95c435f34781c62a14163846e8c43c098fb"
+          }
+        }
+      ],
+      "created_at": "2026-11-10T21:13:45.385396122Z",
+      "updated_at": "2026-11-10T21:16:19.118219832Z",
+      "seal": {
+        "by": "server",
+        "mac": "b1894dd24a91d80b22287980a75f51520ff003d2e02e831755fd3860433dd431"
+      }
+    },
+    {
+      "id": "CLM-0192",
+      "statement": "The envd cache keeps same-named sandboxes in different namespaces apart (keyed id -> namespace -> entry), and lookup, remove and wait_until_ready take a namespace.",
+      "kind": "functional",
+      "level": "unit",
+      "integrity_level": 3,
+      "verification_method": "test",
+      "source": "PR body: \"keyed id -> namespace -> entry. lookup, remove and wait_until_ready take a namespace, and namespaces_of(id) lists the candidates.\"",
+      "derived_from": [
+        "CLM-0189"
+      ],
+      "artifacts": [
+        "crates/sandbawks-api/src/envd_cache.rs"
+      ],
+      "tags": [
+        "from-issue:13"
+      ],
+      "status": {
+        "state": "active"
+      },
+      "evidence": [
+        {
+          "id": "EVD-0237",
+          "kind": "test",
+          "locator": "cargo test -p sandbawks-api --lib -- envd_cache (same_name_in_two_namespaces_is_kept_apart, replace_all_keeps_every_namespace_of_a_name)",
+          "summary": "Passed. Test applies sbx-1 in two namespaces, asserts each lookup returns its own address, an unseen namespace returns None, remove(ns,id) drops only that namespace, and the id entry is dropped when empty; replace_all test asserts both namespaces are retained. Signatures lookup(namespace,id)/remove(namespace,id)/wait_until_ready(namespace,id,..) at envd_cache.rs:352,420,470.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/src/envd_cache.rs",
+              "lines": {
+                "start": 1002,
+                "end": 1046
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:14:43.622956893Z",
+          "seal": {
+            "by": "server",
+            "mac": "f2e27811f93d61b529b03b7523e2d2b22a1974964b8ce78020936509cf0c8b04"
+          }
+        }
+      ],
+      "verdicts": [
+        {
+          "verdict": "supported",
+          "rationale": "The cache unit tests assert independent storage, lookup and removal per namespace, and the method signatures take a namespace.",
+          "auditor": "claude-sonnet-5-5",
+          "evidence_ids": [
+            "EVD-0237"
+          ],
+          "recorded_at": "2026-11-10T21:16:19.136163301Z",
+          "seal": {
+            "by": "server",
+            "mac": "c00951101ee9f04f7e492078e1733e62cc0f4586d04da532df4f2821a057c84e"
+          }
+        }
+      ],
+      "created_at": "2026-11-10T21:13:45.385396122Z",
+      "updated_at": "2026-11-10T21:16:19.136163301Z",
+      "seal": {
+        "by": "server",
+        "mac": "030acba3654d4007cca7aedc4c4d3c3eb1fc03c319e75f49f244edef563d89e5"
+      }
+    },
+    {
+      "id": "CLM-0193",
+      "statement": "The envdAccessToken is <namespace>.<mac>, with the MAC an HMAC-SHA256 over (namespace, NUL, id) under a v2 domain prefix.",
+      "kind": "interface",
+      "level": "unit",
+      "integrity_level": 4,
+      "verification_method": "test",
+      "source": "PR body: \"The token is now <namespace>.<mac>, where the MAC is an HMAC-SHA256 over (namespace, NUL, id) under a new v2 domain.\"",
+      "derived_from": [
+        "CLM-0189"
+      ],
+      "artifacts": [
+        "crates/sandbawks-api/src/envd_auth.rs"
+      ],
+      "tags": [
+        "from-issue:13"
+      ],
+      "status": {
+        "state": "active"
+      },
+      "evidence": [
+        {
+          "id": "EVD-0235",
+          "kind": "inspection",
+          "locator": "crates/sandbawks-api/src/envd_auth.rs:99-155,228-239",
+          "summary": "envd_access_token returns namespace + '.' + base64url(token_mac); token_mac feeds HMAC-SHA256 with TOKEN_DOMAIN (b\"sandbawks/envd-access-token/v2\\0\"), namespace, 0x00, sandbox_id.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/src/envd_auth.rs",
+              "lines": {
+                "start": 228,
+                "end": 239
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:14:23.453576464Z",
+          "seal": {
+            "by": "server",
+            "mac": "a714f6819b75e9fd873550363724b8b981293a069199e5be2e6975d55fce63c2"
+          }
+        },
+        {
+          "id": "EVD-0236",
+          "kind": "test",
+          "locator": "cargo test -p sandbawks-api --lib envd_auth::tests::token_is_stable_and_per_sandbox_and_namespace, namespace_and_id_boundary_is_unambiguous",
+          "summary": "Passed. Asserts the token splits as (\"team-a\", 43-char mac), differs across ids, namespaces and keys, and token_mac(\"ab\",\"c\") != token_mac(\"a\",\"bc\"). No test pins the exact v2 domain bytes against a known vector, but the derivation is by inspection.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/src/envd_auth.rs",
+              "lines": {
+                "start": 296,
+                "end": 321
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:14:23.471336327Z",
+          "seal": {
+            "by": "server",
+            "mac": "ba8efa396d68ec7663657188b01aa59b6b145082163d9af5593464463e357e20"
+          }
+        }
+      ],
+      "verdicts": [
+        {
+          "verdict": "supported",
+          "rationale": "Code builds namespace.mac with HMAC over v2 domain, namespace, NUL, id; tests pin the shape, per-namespace distinctness and the boundary.",
+          "auditor": "claude-sonnet-5-5",
+          "evidence_ids": [
+            "EVD-0235",
+            "EVD-0236"
+          ],
+          "recorded_at": "2026-11-10T21:16:19.150002872Z",
+          "seal": {
+            "by": "server",
+            "mac": "db0a6aafb1620a82b05559bdcf995da467ed2574545cdf080c0c8df21696072b"
+          }
+        }
+      ],
+      "created_at": "2026-11-10T21:13:45.385396122Z",
+      "updated_at": "2026-11-10T21:16:19.150002872Z",
+      "seal": {
+        "by": "server",
+        "mac": "0b8efb82e4ec30a85f9f03b85909c81486de6e7f229d9196cd4cca15e497ddb5"
+      }
+    },
+    {
+      "id": "CLM-0194",
+      "statement": "verify_access_token returns the namespace the token authorises before any sandbox lookup, and a token whose namespace label is changed fails the MAC (the proxy answers 401).",
+      "kind": "security",
+      "level": "unit",
+      "integrity_level": 4,
+      "verification_method": "test",
+      "source": "PR body: \"verify_access_token returns the namespace the token authorises, before any sandbox lookup. A token whose namespace label is changed fails the MAC.\"; issue #13: bind the namespace into the signed envd access token",
+      "derived_from": [
+        "CLM-0189"
+      ],
+      "artifacts": [
+        "crates/sandbawks-api/src/envd_auth.rs",
+        "crates/sandbawks-api/src/routes/envd_proxy.rs"
+      ],
+      "tags": [
+        "from-issue:13"
+      ],
+      "status": {
+        "state": "active"
+      },
+      "evidence": [
+        {
+          "id": "EVD-0238",
+          "kind": "inspection",
+          "locator": "crates/sandbawks-api/src/envd_auth.rs:165-181; routes/envd_proxy.rs:222-260,377-379",
+          "summary": "verify_access_token splits at the first '.', recomputes the full token for that (namespace,id) and constant-time compares the whole string, returning the namespace on match. classify_sandbox calls authorize() (which does this) before any envd_cache.lookup or apiserver get.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/src/envd_auth.rs",
+              "lines": {
+                "start": 165,
+                "end": 181
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:14:43.663271190Z",
+          "seal": {
+            "by": "server",
+            "mac": "3e4f1023a1f19135c7141f1d2c7d628fd05b196fbf6f6ab65d6632122bc3eb61"
+          }
+        },
+        {
+          "id": "EVD-0239",
+          "kind": "test",
+          "locator": "cargo test --workspace --all-targets: envd_auth::tests::a_token_cannot_be_relabelled_to_another_namespace, verify_access_token_returns_the_namespace_it_was_issued_for; tests/envd_proxy.rs::relabelled_token_returns_401 (line 527)",
+          "summary": "Passed. relabelled_token_returns_401 takes a team-a token's MAC, relabels it team-b, sends it to /health and asserts StatusCode::UNAUTHORIZED. The unit test asserts verify returns Some(\"team-a\") for the matching id and None for a different id.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/tests/envd_proxy.rs",
+              "lines": {
+                "start": 526,
+                "end": 537
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:14:43.681164153Z",
+          "seal": {
+            "by": "server",
+            "mac": "d78002243cbad6d66616b8aef7c0ad743c9385add5726690027dd30c491c2b37"
+          }
+        }
+      ],
+      "verdicts": [
+        {
+          "verdict": "supported",
+          "rationale": "verification precedes any lookup and recomputes the MAC over the claimed namespace; the proxy test asserts a relabelled token is 401.",
+          "auditor": "claude-sonnet-5-5",
+          "evidence_ids": [
+            "EVD-0238",
+            "EVD-0239"
+          ],
+          "recorded_at": "2026-11-10T21:16:19.167612749Z",
+          "seal": {
+            "by": "server",
+            "mac": "1156868d0fa5cd669cd2599f229816c8223b5fe25586d17da2a0f5d3b9e6a3ec"
+          }
+        }
+      ],
+      "created_at": "2026-11-10T21:13:45.385396122Z",
+      "updated_at": "2026-11-10T21:16:19.167612749Z",
+      "seal": {
+        "by": "server",
+        "mac": "c6f473f9125d4d2fe23cd6db9d580d06b7eb105fc8770062a42d7c9da6487175"
+      }
+    },
+    {
+      "id": "CLM-0195",
+      "statement": "A token for namespace B never reaches a sandbox with the same id in namespace A.",
+      "kind": "security",
+      "level": "unit",
+      "integrity_level": 4,
+      "verification_method": "test",
+      "source": "PR body: \"A token never reaches the same id in another namespace.\"; issue #13: uniqueness across namespaces isn't enforced",
+      "derived_from": [
+        "CLM-0189"
+      ],
+      "artifacts": [
+        "crates/sandbawks-api/src/routes/envd_proxy.rs",
+        "crates/sandbawks-api/tests/envd_proxy.rs"
+      ],
+      "tags": [
+        "from-issue:13"
+      ],
+      "status": {
+        "state": "active"
+      },
+      "evidence": [
+        {
+          "id": "EVD-0240",
+          "kind": "test",
+          "locator": "tests/envd_proxy.rs::token_does_not_reach_the_same_id_in_another_namespace (line 513)",
+          "summary": "Passed. Team-a's copy is cached paused (would yield 403 if reached); a team-b token for the same id yields 404 because lookup/get run in team-b. Asserts StatusCode::NOT_FOUND.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/tests/envd_proxy.rs",
+              "lines": {
+                "start": 509,
+                "end": 523
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:14:43.698260092Z",
+          "seal": {
+            "by": "server",
+            "mac": "0e513127a29b06eefec7dc2c04ac5329f9212c3cfafa70af8f6c170a0bdd68f3"
+          }
+        }
+      ],
+      "verdicts": [
+        {
+          "verdict": "supported",
+          "rationale": "The test caches a paused same-id sandbox in team-a and shows a team-b token gets 404, not 403.",
+          "auditor": "claude-sonnet-5-5",
+          "evidence_ids": [
+            "EVD-0240"
+          ],
+          "recorded_at": "2026-11-10T21:16:19.180617825Z",
+          "seal": {
+            "by": "server",
+            "mac": "c516db75b65abf56afbe020144dae079684c0d5c234248f7d577c31938a4c9d9"
+          }
+        }
+      ],
+      "created_at": "2026-11-10T21:13:45.385396122Z",
+      "updated_at": "2026-11-10T21:16:19.180617825Z",
+      "seal": {
+        "by": "server",
+        "mac": "380ee451cd3e52da57c166abb7bcd5a874d4d62f9eb1e8cc128220eaf5affe3e"
+      }
+    },
+    {
+      "id": "CLM-0196",
+      "statement": "Legacy namespace-less tokens are still accepted, but only for the default namespace.",
+      "kind": "interface",
+      "level": "unit",
+      "integrity_level": 3,
+      "verification_method": "test",
+      "source": "PR body: \"Legacy namespace-less tokens are still accepted, but only for the default namespace.\" and Compatibility section",
+      "derived_from": [
+        "CLM-0189"
+      ],
+      "artifacts": [
+        "crates/sandbawks-api/src/envd_auth.rs",
+        "crates/sandbawks-api/src/routes/envd_proxy.rs"
+      ],
+      "tags": [
+        "from-issue:13"
+      ],
+      "status": {
+        "state": "active"
+      },
+      "evidence": [
+        {
+          "id": "EVD-0241",
+          "kind": "test",
+          "locator": "tests/envd_proxy.rs::legacy_token_is_scoped_to_the_default_namespace (line 540); envd_auth::tests::legacy_token_authorises_only_the_default_namespace (line 348)",
+          "summary": "Passed. A legacy token passes auth for the default namespace (404 from the empty store, not 401) and, with a paused same-id sandbox cached in team-b, still answers 404 (never 403), so it never reaches team-b. verify_access_token's no-'.' branch returns default_namespace (envd_auth.rs:176-177).",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/tests/envd_proxy.rs",
+              "lines": {
+                "start": 539,
+                "end": 561
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:14:43.717544511Z",
+          "seal": {
+            "by": "server",
+            "mac": "cbc58dff8cc5c4a1a977fd6f2b15aa47587e466b54cd6a5feaa1f8bb53dcb97e"
+          }
+        }
+      ],
+      "verdicts": [
+        {
+          "verdict": "supported",
+          "rationale": "Test shows a legacy token passes for the default namespace and never reaches a team-b sandbox of the same id; the verify branch returns default_namespace.",
+          "auditor": "claude-sonnet-5-5",
+          "evidence_ids": [
+            "EVD-0241"
+          ],
+          "recorded_at": "2026-11-10T21:16:19.197671867Z",
+          "seal": {
+            "by": "server",
+            "mac": "ad0ca96d911639b42bd6016355464b8ea90e2cf5f8b44bc7bf5bc894ed759f9d"
+          }
+        }
+      ],
+      "created_at": "2026-11-10T21:13:45.385396122Z",
+      "updated_at": "2026-11-10T21:16:19.197671867Z",
+      "seal": {
+        "by": "server",
+        "mac": "dcbf095f10dccd9bf2c643d7c0ed44864433cf2d4f855dd1a0a7ab831c8a9159"
+      }
+    },
+    {
+      "id": "CLM-0197",
+      "statement": "A /files signature (which carries no namespace) is checked against the token of each namespace the cache holds that id in, then against the legacy default-namespace token.",
+      "kind": "functional",
+      "level": "unit",
+      "integrity_level": 3,
+      "verification_method": "test",
+      "source": "PR body: \"A /files signature, which carries no namespace, is checked against the token of each namespace the cache holds that id in, then against the legacy default-namespace token.\"",
+      "derived_from": [
+        "CLM-0189"
+      ],
+      "artifacts": [
+        "crates/sandbawks-api/src/routes/envd_proxy.rs"
+      ],
+      "tags": [
+        "from-issue:13"
+      ],
+      "status": {
+        "state": "active"
+      },
+      "evidence": [
+        {
+          "id": "EVD-0242",
+          "kind": "inspection",
+          "locator": "crates/sandbawks-api/src/routes/envd_proxy.rs:237-257",
+          "summary": "When X-Access-Token fails and a signature is present, authorize loops over envd_cache.namespaces_of(id), verifying the signature against each namespace's token (returning that namespace on a match), then against legacy_envd_access_token (returning default_namespace).",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/src/routes/envd_proxy.rs",
+              "lines": {
+                "start": 237,
+                "end": 257
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:14:43.742811128Z",
+          "seal": {
+            "by": "server",
+            "mac": "61f0b938d45d5bbe724e176562df76d9af3d2a75c0f589ddd4570c8da9697112"
+          }
+        },
+        {
+          "id": "EVD-0243",
+          "kind": "test",
+          "locator": "tests/envd_proxy.rs::signed_url_resolves_the_namespace_from_the_cache (line 565); tests/envd_proxy.rs::signed_files_download_passes_auth (line 244)",
+          "summary": "Passed. Signature made with team-b's token, team-b's paused sandbox cached: 403 (not 401), so the cached-namespace candidate matched. signed_files_download_passes_auth signs with the legacy token and gets 404 (passed auth, empty store), covering the legacy fallback.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/tests/envd_proxy.rs",
+              "lines": {
+                "start": 563,
+                "end": 585
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:15:11.478174375Z",
+          "seal": {
+            "by": "server",
+            "mac": "cfab7dd271fa14aaef4e3165b6d66a7242a0faa7e5a70fe2c3a94aa66d958e57"
+          }
+        }
+      ],
+      "verdicts": [
+        {
+          "verdict": "supported",
+          "rationale": "authorize iterates namespaces_of(id) then the legacy token; tests cover a team-b signature (403) and a legacy-signed URL (passes auth).",
+          "auditor": "claude-sonnet-5-5",
+          "evidence_ids": [
+            "EVD-0242",
+            "EVD-0243"
+          ],
+          "recorded_at": "2026-11-10T21:16:19.211359538Z",
+          "seal": {
+            "by": "server",
+            "mac": "f2c4f5c8955c1e61e4fce2c3f306ef3b7eade911b07ed63e62f507e6ad373269"
+          }
+        }
+      ],
+      "created_at": "2026-11-10T21:13:45.385396122Z",
+      "updated_at": "2026-11-10T21:16:19.211359538Z",
+      "seal": {
+        "by": "server",
+        "mac": "0da3fca64a7ccc467579d561226a1bfac4c40db44e562690c27bf5fd6b29097f"
+      }
+    },
+    {
+      "id": "CLM-0198",
+      "statement": "SignedUrlPayload gains an optional namespace; /files/mint sets it to the caller's team namespace, upload and download resolve the sandbox there, and a token without the field falls back to the default namespace.",
+      "kind": "functional",
+      "level": "unit",
+      "integrity_level": 4,
+      "verification_method": "test",
+      "source": "PR body: \"/files/mint sets it to the caller's team namespace, and upload/download resolve there. A token without the field falls back to the default namespace.\"; \"/files/mint took no team context, so any valid key could mint a URL for any default-namespace sandbox id.\"",
+      "derived_from": [
+        "CLM-0189"
+      ],
+      "artifacts": [
+        "crates/sandbawks-api/src/signing.rs",
+        "crates/sandbawks-api/src/routes/files.rs"
+      ],
+      "tags": [
+        "from-issue:13"
+      ],
+      "status": {
+        "state": "active"
+      },
+      "evidence": [
+        {
+          "id": "EVD-0244",
+          "kind": "inspection",
+          "locator": "src/signing.rs:81-88; src/routes/files.rs:136-162,188-196,233-241",
+          "summary": "SignedUrlPayload.namespace: Option<String> with serde(default, skip_serializing_if None). mint_url extracts TeamContext and sets namespace: Some(team.namespace). upload and download use payload.namespace.as_deref().unwrap_or(&state.default_namespace) as the namespace for envd_addr_for.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/src/routes/files.rs",
+              "lines": {
+                "start": 136,
+                "end": 162
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:15:11.511712826Z",
+          "seal": {
+            "by": "server",
+            "mac": "fa13a1a9a410e9b5119f40d873c75f3dddf624279e3c677f87ba3183c3f4d10b"
+          }
+        },
+        {
+          "id": "EVD-0245",
+          "kind": "test",
+          "locator": "tests/files.rs::mint_binds_the_url_to_the_callers_namespace (line 94); tests/signing.rs::round_trips_namespace (92), pre_namespace_token_still_verifies (102)",
+          "summary": "Passed. Mint with a team-b key under a gateway whose default is team-acme returns a URL whose verified payload has namespace == Some(\"team-b\"). Signing tests round-trip Some and None and show None is omitted from the body. No test drives upload/download handlers to assert they resolve in payload.namespace, nor the None -> default fallback in those handlers; those two are by inspection only (files.rs:191-196, 236-241).",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/tests/files.rs",
+              "lines": {
+                "start": 91,
+                "end": 123
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:15:11.533537760Z",
+          "seal": {
+            "by": "server",
+            "mac": "8476cfb1bd9a62a817e262090b91ae3ab7a61e15493c0106bbcf9585a87febc3"
+          }
+        },
+        {
+          "id": "EVD-0257",
+          "kind": "test",
+          "locator": "cargo test -p sandbawks-api --test files (9 passed); tests/files.rs::signed_download_resolves_in_the_tokens_namespace (lines 125-194) at 6ab68c1",
+          "summary": "Passed. A sandbox exists only in team-b (FakeSandboxOps now matches namespace on get, sandboxes.rs create/get). A signed GET /files/download token minted with namespace Some(\"team-b\") answers 502 (found, no envd address), Some(\"team-c\") answers 404, None answers 404 with default team-acme. Asserts on StatusCode, so download resolution by payload.namespace and the None -> default fallback are covered. Upload shares the same expression but has no dedicated test.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/tests/files.rs",
+              "lines": {
+                "start": 125,
+                "end": 194
+              },
+              "commit": "6ab68c1509d24ad0f364f5de7c0054b8ab43a1c0"
+            }
+          },
+          "recorded_at": "2026-11-10T21:25:59.230354378Z",
+          "seal": {
+            "by": "server",
+            "mac": "4685ea9c37172a3e263db40c8aff6e1bc896730906bbbaf5213c6ed63c0c6039"
+          }
+        },
+        {
+          "id": "EVD-0258",
+          "kind": "demonstration",
+          "locator": "SANDBAWKS_API_BASE=http://localhost:18080 bash deploy/kind/fixtures/api-smoke.sh (kind cluster sandbawks-i13, my own run, exit 0)",
+          "summary": "Reproduced. The script's tenant section mints a PUT and a GET signed URL with the api-smoke-tenant key for a sandbox in namespace api-smoke-tenant, uploads (expects 204) and downloads, cmp matches; output ended \"SUCCESS ... (default and tenant namespace)\". This exercises the real upload and download handlers resolving the tenant namespace from the token. The default-namespace round-trip decoded payload shows \"namespace\":\"default\" in its token body.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "deploy/kind/fixtures/api-smoke.sh",
+              "lines": {
+                "start": 342,
+                "end": 389
+              },
+              "commit": "6ab68c1509d24ad0f364f5de7c0054b8ab43a1c0"
+            }
+          },
+          "recorded_at": "2026-11-10T21:25:59.252209471Z",
+          "seal": {
+            "by": "server",
+            "mac": "6d4bcd5ed4c8382ec397201ffc79e6e201d9fbef207925809942f26b248f1d47"
+          }
+        }
+      ],
+      "verdicts": [
+        {
+          "verdict": "not_enough_info",
+          "rationale": "Mint binding and payload round-trip (with and without namespace) are tested and the code is plainly correct, but no test drives the upload or download handler to show it resolves in payload.namespace or falls back to the default; the PR body lists only the mint and signing tests, so this part of the claim rests on reading alone at integrity level 4. Fix: add a files.rs integration test that mints a team-b token and calls GET /files/download (and PUT upload) with a sandbox present only in team-b, asserting it resolves there, plus a token with namespace None resolving in the default namespace.",
+          "auditor": "claude-sonnet-5-5",
+          "evidence_ids": [],
+          "recorded_at": "2026-11-10T21:16:19.226671629Z",
+          "seal": {
+            "by": "server",
+            "mac": "0a158e7aa7731da2b04b0c65f264a6e6ed6e2b985fb21479565047de49b13c9f"
+          }
+        },
+        {
+          "verdict": "supported",
+          "rationale": "The new test shows download resolving in the token's namespace (502 vs 404 for another or no namespace), the mint test shows the namespace is set, and my live run of api-smoke.sh round-trips upload and download for a tenant-namespace sandbox. Upload has no unit test of its own, but the live run covers it.",
+          "auditor": "claude-sonnet-5-5",
+          "evidence_ids": [
+            "EVD-0244",
+            "EVD-0245",
+            "EVD-0257",
+            "EVD-0258"
+          ],
+          "recorded_at": "2026-11-10T21:26:11.508907219Z",
+          "seal": {
+            "by": "server",
+            "mac": "d2033beb19c3be13cfe808b9762d7dfd313d689625f0ac8eb0e1a68fe76bf96a"
+          }
+        }
+      ],
+      "created_at": "2026-11-10T21:13:45.385396122Z",
+      "updated_at": "2026-11-10T21:26:11.508907219Z",
+      "seal": {
+        "by": "server",
+        "mac": "c960f07a84a8a84f55dd776c22533a7c8839031f721fa67fc538976a4400cd15"
+      }
+    },
+    {
+      "id": "CLM-0199",
+      "statement": "note_activity takes a namespace, the throttle is keyed by namespace/id, and the proxy and exec paths stamp activity in the sandbox's own namespace.",
+      "kind": "functional",
+      "level": "unit",
+      "integrity_level": 3,
+      "verification_method": "analysis",
+      "source": "PR body: \"note_activity(namespace, id), with the throttle keyed by namespace/id.\"; \"Idle-activity stamps from the proxy and exec paths went to the default namespace\"",
+      "derived_from": [
+        "CLM-0189"
+      ],
+      "artifacts": [
+        "crates/sandbawks-api/src/activity.rs",
+        "crates/sandbawks-api/src/routes/exec.rs",
+        "crates/sandbawks-api/src/routes/envd_proxy.rs"
+      ],
+      "tags": [
+        "from-issue:13"
+      ],
+      "status": {
+        "state": "active"
+      },
+      "evidence": [
+        {
+          "id": "EVD-0246",
+          "kind": "inspection",
+          "locator": "src/activity.rs:147-170; src/routes/exec.rs:254,270; src/routes/envd_proxy.rs:603,1821,1853,1993",
+          "summary": "note_activity(namespace,id) keys the throttle with format!(\"{namespace}/{id}\") and stamps in that namespace. exec passes team.namespace (initial and heartbeat). Every note_activity call in envd_proxy.rs passes &sandbox.namespace. git grep of 'note_activity(&id)' style single-arg calls finds none; no remaining caller passes state.default_namespace.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/src/activity.rs",
+              "lines": {
+                "start": 144,
+                "end": 170
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:15:11.553441456Z",
+          "seal": {
+            "by": "server",
+            "mac": "fa338b27b938bfd12b8e5a28a1b65a37da672e243fb1d29610bd70bcd40d51da"
+          }
+        },
+        {
+          "id": "EVD-0247",
+          "kind": "analysis",
+          "locator": "git grep -nE 'note_activity\\(' crates/",
+          "summary": "Every call site passes a namespace as first argument (6 in envd_proxy.rs, 2 in exec.rs, plus the definition). There is no test asserting which namespace stamp_activity receives; the claim rests on reading.",
+          "stance": "neutral",
+          "anchor": {
+            "search": {
+              "pattern": "note_activity\\(",
+              "scope": [
+                "crates"
+              ],
+              "hits": 7,
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:15:11.578300485Z",
+          "seal": {
+            "by": "server",
+            "mac": "b1c2556ce7766a0576a3d705cf327dfb760daf9b5ca1c763dd88ccf10f508203"
+          }
+        },
+        {
+          "id": "EVD-0261",
+          "kind": "demonstration",
+          "locator": "live kind cluster sandbawks-i13: create tenant sandbox via api-smoke-tenant key; GET /files?path=/etc/hostname with E2b-Sandbox-Id and X-Access-Token; kubectl -n api-smoke-tenant get sandbox -o jsonpath='{.status.lastActivityTimestamp}'",
+          "summary": "Reproduced. Before the call lastActivityTimestamp was empty; after GET /files (HTTP 200) through the proxy it was 2026-11-10T21:25:32.544Z, matching the call time (21:25:32Z), on a sandbox that does not exist in namespace default. Controls: /health (documented not to stamp) left it empty after 18 s. team-b sandboxes sbx-cba39b7830d0 and sbx-cbfadfcba246 also carry stamps from the producer's earlier SDK use.",
+          "stance": "supports",
+          "recorded_at": "2026-11-10T21:25:59.305268045Z",
+          "seal": {
+            "by": "server",
+            "mac": "6dbf2b52ee97fdec6122a6b0edb1b5eaf843696621cfc91611af01205e913051"
+          }
+        }
+      ],
+      "verdicts": [
+        {
+          "verdict": "supported",
+          "rationale": "By analysis: all 8 call sites pass a namespace (proxy: sandbox.namespace; exec: team.namespace), the throttle key includes it, and stamp_activity receives it. No test pins the stamped namespace, which is a coverage gap rather than a defect.",
+          "auditor": "claude-sonnet-5-5",
+          "evidence_ids": [
+            "EVD-0246"
+          ],
+          "recorded_at": "2026-11-10T21:16:19.240483500Z",
+          "seal": {
+            "by": "server",
+            "mac": "579bc1c6cc0930a48663438ea6dbf72dd3fb9fa835b8a535b2e3a480579184d2"
+          }
+        },
+        {
+          "verdict": "supported",
+          "rationale": "Strengthened: on a live cluster a proxied GET /files for a sandbox in api-smoke-tenant stamped lastActivityTimestamp in that namespace within the second, with /health as a no-stamp control. Exec's WebSocket stamp path was not exercised live; it rests on the earlier code reading.",
+          "auditor": "claude-sonnet-5-5",
+          "evidence_ids": [
+            "EVD-0246",
+            "EVD-0261"
+          ],
+          "recorded_at": "2026-11-10T21:26:11.555935458Z",
+          "seal": {
+            "by": "server",
+            "mac": "a239205abaa1e300dfdffbd41871d37cb825fb5ae127a12394b344f617e302c7"
+          }
+        }
+      ],
+      "created_at": "2026-11-10T21:13:45.385396122Z",
+      "updated_at": "2026-11-10T21:26:11.555935458Z",
+      "seal": {
+        "by": "server",
+        "mac": "f2498b1cb4ef51b5745e616d5421d0b11b8b951a31441947bf347cdcb4171138"
+      }
+    },
+    {
+      "id": "CLM-0200",
+      "statement": "The sandbox DTO issues the envdAccessToken for the sandbox's metadata.namespace, falling back to the team namespace.",
+      "kind": "interface",
+      "level": "unit",
+      "integrity_level": 3,
+      "verification_method": "test",
+      "source": "PR body: \"the token is issued for the sandbox's metadata.namespace, falling back to the team namespace.\"",
+      "derived_from": [
+        "CLM-0189"
+      ],
+      "artifacts": [
+        "crates/sandbawks-api/src/routes/sandboxes.rs"
+      ],
+      "tags": [
+        "from-issue:13"
+      ],
+      "status": {
+        "state": "active"
+      },
+      "evidence": [
+        {
+          "id": "EVD-0248",
+          "kind": "inspection",
+          "locator": "src/routes/sandboxes.rs:750-753",
+          "summary": "sandbox_to_dto computes namespace = sandbox.metadata.namespace.as_deref().unwrap_or(client_id) and calls envd_access_token(key, namespace, &id).",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/src/routes/sandboxes.rs",
+              "lines": {
+                "start": 748,
+                "end": 753
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:15:11.596761453Z",
+          "seal": {
+            "by": "server",
+            "mac": "ec1deed51c891c914c535fd599409b5e154e49312265d93cad32a0ffcbe36166"
+          }
+        },
+        {
+          "id": "EVD-0249",
+          "kind": "test",
+          "locator": "tests/sandboxes.rs lines 112, 382, 631 (expected_token(\"..\") == \"team-acme\"-namespaced token)",
+          "summary": "Passed. create, get and connect responses carry the token for namespace team-acme (the team's namespace). No test builds a Sandbox whose metadata.namespace differs from the team namespace; the two are equal in the real flow, so the divergence branch is untested but not reachable in practice.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "crates/sandbawks-api/tests/sandboxes.rs",
+              "lines": {
+                "start": 28,
+                "end": 36
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:15:11.617326752Z",
+          "seal": {
+            "by": "server",
+            "mac": "49c884154a82da21be94ade740fd82e339316eee1f64d9de5fcc66ecc88f85e1"
+          }
+        }
+      ],
+      "verdicts": [
+        {
+          "verdict": "supported",
+          "rationale": "Code uses metadata.namespace falling back to client_id; sandboxes tests confirm tokens carry the team namespace. The divergent branch is untested but cannot differ in the real flow.",
+          "auditor": "claude-sonnet-5-5",
+          "evidence_ids": [
+            "EVD-0248",
+            "EVD-0249"
+          ],
+          "recorded_at": "2026-11-10T21:16:19.254408362Z",
+          "seal": {
+            "by": "server",
+            "mac": "25f1ac2ef60d1e421991491a5e4dbd6965131c0e72c8c34b6ac6966d646b2e45"
+          }
+        }
+      ],
+      "created_at": "2026-11-10T21:13:45.385396122Z",
+      "updated_at": "2026-11-10T21:16:19.254408362Z",
+      "seal": {
+        "by": "server",
+        "mac": "927115fdbdb4bee3dfb6353a994c7df9d721726af449fc383c2e7c8668845eae"
+      }
+    },
+    {
+      "id": "CLM-0201",
+      "statement": "RBAC and the Helm chart are unchanged, and the gateway's ClusterRole already grants cluster-wide sandboxes get/list/watch and sandboxes/status patch.",
+      "kind": "constraint",
+      "level": "artifact",
+      "integrity_level": 2,
+      "verification_method": "inspection",
+      "source": "PR body: \"Unchanged: RBAC and the chart. The gateway's ClusterRole already grants cluster-wide sandboxes: get/list/watch and sandboxes/status: patch.\"; issue comment",
+      "derived_from": [
+        "CLM-0189"
+      ],
+      "artifacts": [
+        "deploy/helm/sandbawks/templates/rbac.yaml"
+      ],
+      "tags": [
+        "from-issue:13"
+      ],
+      "status": {
+        "state": "active"
+      },
+      "evidence": [
+        {
+          "id": "EVD-0250",
+          "kind": "inspection",
+          "locator": "deploy/helm/sandbawks/templates/rbac.yaml:92-116; git diff --stat main..HEAD -- deploy (empty)",
+          "summary": "ClusterRole sandbawks-api grants sandboxes get/list/watch and sandboxes/status get/patch/update; the diff touches nothing under deploy/.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "deploy/helm/sandbawks/templates/rbac.yaml",
+              "lines": {
+                "start": 92,
+                "end": 116
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:15:11.637483888Z",
+          "seal": {
+            "by": "server",
+            "mac": "43720fc891f6cfeb1e560b4d0998e817f685bf0436ca06f7fc1dd39029215b78"
+          }
+        }
+      ],
+      "verdicts": [
+        {
+          "verdict": "supported",
+          "rationale": "No deploy/ file in the diff, and rbac.yaml's sandbawks-api ClusterRole already grants the needed verbs.",
+          "auditor": "claude-sonnet-5-5",
+          "evidence_ids": [
+            "EVD-0250"
+          ],
+          "recorded_at": "2026-11-10T21:16:19.272042729Z",
+          "seal": {
+            "by": "server",
+            "mac": "2b84f603fc933ea54406510f647af32e21d8b19a47e0129deead7e96c9aa5133"
+          }
+        }
+      ],
+      "created_at": "2026-11-10T21:13:45.385396122Z",
+      "updated_at": "2026-11-10T21:16:19.272042729Z",
+      "seal": {
+        "by": "server",
+        "mac": "cfc929239707d11aad8acb70af343b9932b71ad6c0f0f99e17c42933b51029b2"
+      }
+    },
+    {
+      "id": "CLM-0202",
+      "statement": "just fmt, cargo clippy --all-targets -- -D warnings, and cargo test --workspace --all-targets all pass on the head commit, with 70 test suites and 0 failures.",
+      "kind": "non_functional",
+      "level": "artifact",
+      "integrity_level": 2,
+      "verification_method": "test",
+      "source": "PR body Validation: \"just test (cargo test --workspace --all-targets: 70 suites, 0 failures)\"",
+      "derived_from": [
+        "CLM-0189"
+      ],
+      "artifacts": [
+        "crates/sandbawks-api"
+      ],
+      "tags": [
+        "from-issue:13"
+      ],
+      "status": {
+        "state": "active"
+      },
+      "evidence": [
+        {
+          "id": "EVD-0251",
+          "kind": "test",
+          "locator": "cargo test --workspace --all-targets (twice, on bb5a2c8); cargo clippy --workspace --all-targets -- -D warnings; cargo fmt --check",
+          "summary": "cargo test: exit 0, 70 \"test result\" lines, 0 with failures, 1148 tests passed. clippy -D warnings: finished with no diagnostics. cargo fmt --check: exit 0. The `just` wrappers themselves were not run; the underlying cargo commands were.",
+          "stance": "supports",
+          "recorded_at": "2026-11-10T21:15:11.650772802Z",
+          "seal": {
+            "by": "server",
+            "mac": "018b3035c46aab9a87b80a4393e2f075ae91acddeaca8c10153b26e917edf531"
+          }
+        }
+      ],
+      "verdicts": [
+        {
+          "verdict": "supported",
+          "rationale": "I reran the cargo commands on bb5a2c8: 70 suites, 0 failures, 1148 passed; clippy -D warnings and fmt --check clean. The just wrappers were not run.",
+          "auditor": "claude-sonnet-5-5",
+          "evidence_ids": [
+            "EVD-0251"
+          ],
+          "recorded_at": "2026-11-10T21:16:19.285805550Z",
+          "seal": {
+            "by": "server",
+            "mac": "b1ae5fe36ec4e9d4b5c3acb2fdab346113b11e43dbdc0fe4fcf68f8430c423a4"
+          }
+        }
+      ],
+      "created_at": "2026-11-10T21:13:45.385396122Z",
+      "updated_at": "2026-11-10T21:16:19.285805550Z",
+      "seal": {
+        "by": "server",
+        "mac": "f79ce473a9edc51c2356ce403bb62775a590bf32607b08610953cb2f8e87a144"
+      }
+    },
+    {
+      "id": "CLM-0203",
+      "statement": "The change adds a kind-smoke case with a TeamAPIKey whose spec.namespace differs from the release namespace, running files.write and commands.run.",
+      "kind": "functional",
+      "level": "artifact",
+      "integrity_level": 2,
+      "verification_method": "inspection",
+      "source": "Issue #13 possible fix, third bullet: \"Add a kind-smoke case with a TeamAPIKey whose spec.namespace differs from the release namespace, running files.write and commands.run.\"",
+      "derived_from": [
+        "CLM-0189"
+      ],
+      "artifacts": [
+        "tests",
+        "docs"
+      ],
+      "tags": [
+        "from-issue:13"
+      ],
+      "status": {
+        "state": "active"
+      },
+      "evidence": [
+        {
+          "id": "EVD-0252",
+          "kind": "analysis",
+          "locator": "git diff --name-only main..HEAD (no file under tests/, deploy/kind, justfile); git grep -E 'spec\\.namespace|namespace: *team-' -- tests deploy/kind justfile",
+          "summary": "The diff touches only crates/sandbawks-api sources/tests and one changelog file; no kind-smoke, e2b-sdk-compat or fixture file changed. Existing smoke fixtures (justfile, deploy/kind/fixtures/api-smoke.sh) seed one TeamAPIKey for the release namespace; the search for a TeamAPIKey with a non-release spec.namespace in tests/deploy/kind/justfile finds nothing. The only new tests are in-process Rust tests with fake stores.",
+          "stance": "refutes",
+          "anchor": {
+            "search": {
+              "pattern": "spec\\.namespace|namespace: *team-[a-z]",
+              "scope": [
+                "deploy/kind",
+                "justfile",
+                "tests"
+              ],
+              "hits": 3,
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:15:24.287606076Z",
+          "seal": {
+            "by": "server",
+            "mac": "af213d05eeddd812d125fd6775f87d63258971e35d07673851c5060d30977780"
+          }
+        },
+        {
+          "id": "EVD-0253",
+          "kind": "inspection",
+          "locator": "deploy/kind/fixtures/api-smoke.sh:123-136",
+          "summary": "Correction to the search item: its 3 hits are comments in the existing fixtures that spec.namespace is \"${NAMESPACE}\". The api-smoke fixture sets spec.namespace to the release namespace (\"runs the tenant in the same namespace\"), so no smoke case exercises a different tenant namespace, and the diff changes none of these files.",
+          "stance": "refutes",
+          "anchor": {
+            "file": {
+              "path": "deploy/kind/fixtures/api-smoke.sh",
+              "lines": {
+                "start": 123,
+                "end": 136
+              },
+              "commit": "bb5a2c8bdb58b798102c8074026087f2decd8b43"
+            }
+          },
+          "recorded_at": "2026-11-10T21:15:45.382612277Z",
+          "seal": {
+            "by": "server",
+            "mac": "efb6d43fd706581a9e18b0f3ca4db279959c164b6d1eff45a207bba1e9a27277"
+          }
+        },
+        {
+          "id": "EVD-0259",
+          "kind": "inspection",
+          "locator": "deploy/kind/fixtures/api-smoke.sh:270-389 at 6ab68c1",
+          "summary": "The fixture now creates namespace api-smoke-tenant, a SandboxTemplate there, and a second TeamAPIKey with spec.namespace set to it, creates a sandbox with that key, asserts the envdAccessToken starts with that namespace, checks envd /health via the proxy returns 200, does a signed-URL upload/download round-trip with cmp, and kills it. Limits: it uses the proxy /health and signed URLs, not files.write or commands.run as the issue literally named; the SDK-level files.write/commands.run run is only in the producer's changelog.",
+          "stance": "supports",
+          "anchor": {
+            "file": {
+              "path": "deploy/kind/fixtures/api-smoke.sh",
+              "lines": {
+                "start": 270,
+                "end": 389
+              },
+              "commit": "6ab68c1509d24ad0f364f5de7c0054b8ab43a1c0"
+            }
+          },
+          "recorded_at": "2026-11-10T21:25:59.272338856Z",
+          "seal": {
+            "by": "server",
+            "mac": "9996d024d29fe43bc038c58f32b4e39284416a3f98b9ca0fb536406d3246e1f0"
+          }
+        },
+        {
+          "id": "EVD-0260",
+          "kind": "demonstration",
+          "locator": "KUBECONFIG=<kubeconfig-i13> SANDBAWKS_API_BASE=http://localhost:18080 bash deploy/kind/fixtures/api-smoke.sh; rc=0",
+          "summary": "I ran the updated script against the live kind cluster: default-namespace lifecycle and file round-trip passed, then the tenant case passed (RBAC ready, sandbox created, envdAddress populated, /health 200, signed-URL round-trip, kill 204) and it printed SUCCESS.",
+          "stance": "supports",
+          "recorded_at": "2026-11-10T21:25:59.288431994Z",
+          "seal": {
+            "by": "server",
+            "mac": "9514739951d9aaedb31ddfa2918b2009f86a3265cb155cbb57cf279ffa15eeeb"
+          }
+        }
+      ],
+      "verdicts": [
+        {
+          "verdict": "refuted",
+          "rationale": "The diff changes no smoke fixture, and the existing api-smoke fixture runs the tenant in the release namespace, so no case exercises a different tenant namespace. This was a suggested item in the issue's Possible fix, not a hard requirement, so it is advisory. Fix: either add a second TeamAPIKey with spec.namespace set to a new namespace plus files.write and commands.run to deploy/kind/fixtures/api-smoke.sh, or state in the PR description that the kind-smoke case is deferred to a follow-up issue.",
+          "auditor": "claude-sonnet-5-5",
+          "evidence_ids": [
+            "EVD-0252",
+            "EVD-0253"
+          ],
+          "recorded_at": "2026-11-10T21:16:19.301992267Z",
+          "seal": {
+            "by": "server",
+            "mac": "4dbe74160987eaa71b08bd5555304f98aa65b9e198d930c615075b2295319baf"
+          }
+        },
+        {
+          "verdict": "supported",
+          "rationale": "The earlier refutation (no tenant case) no longer holds: 6ab68c1 adds one and I ran it green on a live cluster. It uses /health and signed-URL upload/download rather than literal files.write and commands.run, which satisfies the intent (envd traffic in a non-release tenant namespace).",
+          "auditor": "claude-sonnet-5-5",
+          "evidence_ids": [
+            "EVD-0259",
+            "EVD-0260"
+          ],
+          "recorded_at": "2026-11-10T21:26:11.538472624Z",
+          "seal": {
+            "by": "server",
+            "mac": "58f9252ed8ed0cb6a25264349cc5652bef39900081865beebbd736fad47233f6"
+          }
+        }
+      ],
+      "created_at": "2026-11-10T21:13:45.385396122Z",
+      "updated_at": "2026-11-10T21:26:11.538472624Z",
+      "seal": {
+        "by": "server",
+        "mac": "21071f133e8c4c73c3008eddf2b00d464f3c10c2e3116a1ec0ffa104b6d1bee9"
       }
     }
   ]
