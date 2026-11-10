@@ -41,7 +41,7 @@ governs all three workloads.
 
 - `deploy/kind/fixtures/otel-collector.yaml`: an `observability` namespace
   running `otel/opentelemetry-collector-contrib:0.123.0` (pinned, pulled via
-  the a Docker Hub pull-through proxy proxy). Accepts OTLP on :4317 (gRPC) / :4318
+  a Docker Hub pull-through proxy). Accepts OTLP on :4317 (gRPC) / :4318
   (HTTP) and dumps every signal to stdout via the `debug` exporter at
   `verbosity: detailed`. The collector's own telemetry log level is left at
   the `info` default on purpose — the debug exporter writes through that same

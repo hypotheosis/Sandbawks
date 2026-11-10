@@ -42,7 +42,7 @@ therefore never publish to the package registry on this instance.
 - `REG_TOKEN` now reads a `PACKAGES_TOKEN` secret instead of
   `secrets.GITHUB_TOKEN`. `PACKAGES_TOKEN` must be a Forgejo access token with
   `write:package` (and `delete:package` for the `latest` DELETE) scope, owned by
-  a member of the `gfd` org with package-write access.
+  a member of the Forgejo org with package-write access.
 - Removed the proven-ineffective `permissions:` block (reverts the job to its
   pre-#251 default token scope, which checkout already worked under).
 - `REG_USER` stays `github.actor`; since Gitea authenticates by the token and
@@ -53,7 +53,7 @@ therefore never publish to the package registry on this instance.
 ## Operator action required
 
 Create the secret before this can succeed: a Forgejo access token with
-`write:package` scope, added as repo (or `gfd`-org) secret `PACKAGES_TOKEN`.
+`write:package` scope, added as repo (or org) secret `PACKAGES_TOKEN`.
 
 ## Files touched
 

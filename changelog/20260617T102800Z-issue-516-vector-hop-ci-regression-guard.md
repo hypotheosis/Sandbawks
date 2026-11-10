@@ -64,8 +64,8 @@ Implementation notes:
   constant.
 - **`telemetrygen` pinned to `v0.135.0`** — the first tag whose `metrics`
   subcommand supports `--metric-type Histogram` (0.123.0–0.130.0 only emit
-  Gauge/Sum). Pulled through the ghcr.io pull-through proxy
-  (a ghcr.io pull-through proxy), so the guard needs no direct ghcr.io egress.
+  Gauge/Sum). Pulled through a ghcr.io
+  pull-through proxy, so the guard needs no direct ghcr.io egress.
 - **Config shipped via `docker cp`, not a `-v` bind mount.** Under the Forgejo
   `runs-on: docker` runner the daemon is a separate dind sidecar (reached via
   `DOCKER_HOST`), so a bind mount of a path on the runner-container filesystem

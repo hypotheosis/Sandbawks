@@ -28,7 +28,7 @@ permissions:
 ```
 
 - `packages: write` lifts the ephemeral run token to package-write on the
-  `gfd` org so the `PUT .../api/packages/gfd/generic/...` uploads are accepted.
+  Forgejo org so the `PUT .../api/packages/<org>/generic/...` uploads are accepted.
 - `contents: read` is re-added because declaring any `permissions:` block
   resets every unlisted scope to `none`, which would otherwise break the
   `actions/checkout` step.

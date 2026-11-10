@@ -26,7 +26,7 @@ constraining the `runsc` sentry's host memory consumption.
 
 | Property | Value |
 | --- | --- |
-| Cluster | live k3s, `gfd/sandbawks` |
+| Cluster | live k3s |
 | Node under test | `k8s-libvirt-b8e83881-fcff-49e9-8aa0-c7aae5db24ab` |
 | Node OS / kernel | Ubuntu 24.04.4 LTS / `6.8.0-106-generic` |
 | Container runtime | `containerd://2.0.4-k3s2` |

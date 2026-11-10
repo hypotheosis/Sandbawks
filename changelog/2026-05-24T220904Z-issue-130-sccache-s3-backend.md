@@ -20,7 +20,7 @@ run.
 
 ### Workspace Dockerfiles (controller / api / envd)
 
-Mirroring the pattern from `~/repos/gfd/wnw/wnw-backend/Dockerfile`:
+Mirroring a pattern proven in another project's Dockerfile:
 
 - **`chef` stage**: install sccache 0.10.0 with a
   `command -v sccache || (curl … | tar …)` short-circuit so the

@@ -1,7 +1,7 @@
 # Plan 04 T6 — lifecycle CRUD endpoints
 
 Date: 2026-05-24T15:03:50Z
-Issue: gfd/sandbawks#105 (Plan 04 epic #99)
+Issue: #105 (Plan 04 epic #99)
 
 ## Scope
 

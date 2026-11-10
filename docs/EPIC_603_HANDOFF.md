@@ -8,14 +8,14 @@ Bringing up the AKS Kata pool exposed that sandbawks pause/resume is gVisor/`run
 
 **Start implementation at #604** (CRD foundation). It unlocks the chain.
 
-## Current state of Kata on AKS (`aks-sbawks-prod-eastus2`)
+## Current state of Kata on AKS
 
 - ✅ Kata sandboxes **cold-start and run** end to end (proven: a sandbox ran agentic work to completion).
 - ✅ Kata pause/resume is **safely fail-closed** (PR #602 — see below). It cannot destroy a sandbox.
 - ❌ Kata has **no working pause/resume** yet. #603 delivers it via `filesystem` mode.
-- gVisor on-prem (`default` context) is unaffected throughout; all changes default to current behavior.
+- gVisor clusters are unaffected throughout; all changes default to current behavior.
 
-## How we got here — PRs/issues (all on github.com/hypotheosis/sandbawks)
+## How we got here — PRs/issues (numbers from the pre-release tracker)
 
 Merged (squash):
 - **#593** — `SandboxTemplate` tolerations/nodeSelector (sandbox-Pod scheduling).
@@ -33,7 +33,6 @@ Open:
 
 - **CH-direct snapshot is a dead end.** Live trial (cloud-hypervisor v51 on MSHV): `vm.snapshot` *works* (produces `config.json`+`state.json`+`memory-ranges`, ~1.35 GB), but driving it out-of-band behind the `containerd-shim-kata-v2` **destroyed the VM** (API went unresponsive, `vm.resume` failed, run dir torn down, sandbox → Failed). `vm.restore` needs a fresh VMM the shim won't provide. So CH-direct can't work without shim cooperation (the experimental upstream `pause_with_snapshot` path, absent from stock AKS Kata).
 - **Most use-cases don't need live-memory suspend** — they need files (workspace/checkout/outputs) to survive + low idle cost. `agent-sandbox` does exactly this with Pod-delete + cold-boot + Sandbox-owned PVCs. Runtime-agnostic; works on Kata, gVisor, runc.
-- Findings docs: `<agent-sandbox checkout>/KATA_PAUSE_RESUME_FINDINGS.md` and `.../KATA_PVC_STORAGE_FINDINGS.md`.
 
 ## Decisions locked (with the user)
 
@@ -64,10 +63,7 @@ Dependency graph: `#604 → #605 → #606 → {#607, #608}` (607/608 fork off 60
 
 ## Ops / environment facts (gotchas)
 
-- **AKS access:** context `aks-sbawks-prod-eastus2`; kubectl uses `kubelogin` device-code auth that a non-interactive shell can't complete and that expires mid-session. Have the user run `! kubectl get nodes` to refresh the cached token before kubectl work.
-- **kubernetes-mcp is useless for AKS** — it's hard-pinned to the on-prem `default` context. Use `kubectl` for AKS.
-- **Node containers are distroless** (no shell). To inspect a node: `kubectl debug node/<NODE> --image=docker.io/nicolaka/netshoot --profile=sysadmin --attach=false -- sh -c '...'` (host root at `/host`, hostPID). Pull images via the a Docker Hub pull-through proxy proxy. Debug pods land in the kubeconfig's default ns (was `sandbawks`).
-- **Repo merges via SQUASH** — don't judge merge state by `git log` grep; check the PR itself.
+- **Node containers are distroless** (no shell). To inspect a node: `kubectl debug node/<NODE> --image=docker.io/nicolaka/netshoot --profile=sysadmin --attach=false -- sh -c '...'` (host root at `/host`, hostPID). Debug pods land in the kubeconfig's default namespace.
 - **Helm skips CRDs** — after any CRD change, `kubectl apply -f deploy/crds` (a stale CRD silently prunes new fields). And **bump `deploy/helm/sandbawks/Chart.yaml` `version`** on any chart change.
 - **Standard gates:** `just fmt`, `cargo clippy --all-targets -- -D warnings`, `just test`. Dated changelog under `changelog/` per change.
 - **Kata facts:** RuntimeClass `kata-vm-isolation` (handler `kata`); node taint `kata=true:NoSchedule`; node label `kubernetes.azure.com/kata-vm-isolation=true`; deploy needs `node.runtime: kata`. CH socket `/run/vc/vm/<CRI-sandbox-id>/clh-api.sock` (CRI sandbox id = shim `-id`, NOT pod UID), CH v51 on MSHV.

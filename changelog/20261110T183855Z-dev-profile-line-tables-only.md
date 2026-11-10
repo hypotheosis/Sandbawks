@@ -39,5 +39,4 @@ local variables. Override locally with
 `cargo test --workspace --no-run` into a fresh build directory: **4.4 GB**
 with this profile, against 20 GB for the previous full-debuginfo build
 directory (that one also held clippy's check artifacts, so the comparison is
-approximate). The same setting cut the autobots workspace's test executables
-from 27.9 GB to 6.3 GB.
+approximate).

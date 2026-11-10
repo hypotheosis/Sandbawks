@@ -15,7 +15,7 @@ format "slice:prefix:name" for systemd cgroups, got
 ~60 Pods across argocd, cert-manager, ingress-nginx, keycloak, kyverno,
 external-dns, sandbawks itself, etc. went `RunContainerError` /
 `CrashLoopBackOff`. Privileged host-network DaemonSet pods (cilium,
-node-exporter, synology-csi) kept running, which is the tell that this was the
+node-exporter, a storage CSI driver) kept running, which is the tell that this was the
 *default `runc` runtime* breaking, not the node as a whole.
 
 ## Root cause

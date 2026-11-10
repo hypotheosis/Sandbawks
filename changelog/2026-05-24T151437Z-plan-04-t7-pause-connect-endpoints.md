@@ -1,7 +1,7 @@
 # Plan 04 T7 — pause + connect endpoints
 
 Date: 2026-05-24T15:14:37Z
-Issue: gfd/sandbawks#106 (Plan 04 epic #99)
+Issue: #106 (Plan 04 epic #99)
 
 ## Scope
 

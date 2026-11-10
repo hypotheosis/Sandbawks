@@ -1,7 +1,7 @@
 # Plan 04 T9 — EnvdPool: pooled tonic clients keyed by `host:port`
 
 Date: 2026-05-24T15:58:48Z
-Issue: gfd/sandbawks#108 (Plan 04 epic #99)
+Issue: #108 (Plan 04 epic #99)
 
 ## Scope
 
