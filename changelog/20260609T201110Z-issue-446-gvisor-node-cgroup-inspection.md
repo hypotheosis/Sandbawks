@@ -1,6 +1,6 @@
 # gVisor node-side cgroup inspection: why the sandbox memory limit is not enforced
 
-Issue: #446 (node-side follow-up to #305 / PR #445; parent epic #304 — Greg Bray
+Issue: #446 (node-side follow-up to #305 / PR #445; parent epic #304 — external user
 memory/OOM feedback). Diagnosis only — the fix is #448.
 
 ## Question

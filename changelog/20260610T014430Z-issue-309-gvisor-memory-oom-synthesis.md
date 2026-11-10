@@ -1,11 +1,11 @@
 # gVisor sandbox memory/OOM: findings synthesis + product decision
 
-Issue: #309 (synthesis capstone of epic #304 — Greg Bray feedback on gVisor
+Issue: #309 (synthesis capstone of epic #304 — external user feedback on gVisor
 memory-limit / OOM behavior). Consolidates #305, #306, #446, #448, folds in #308.
 
 ## Origin
 
-Greg Bray relayed a user request: under gVisor, "catch" a memory leak inside a
+A user request came in: under gVisor, "catch" a memory leak inside a
 sandbox to save logs/artifacts before teardown, via a userspace `oomd` or by
 subdividing the pod's memory limit into smaller pieces *from inside* the sandbox
 (the concrete case was a Docker-in-Docker workflow). The folklore was that
@@ -85,7 +85,7 @@ sandbox, node `k8s-libvirt-811bfc83…`):
   verification). So a runaway DinD workload is contained to the pod; it just
   can't be subdivided across inner containers.
 
-Net for Greg's user: the blast radius is contained (the DinD sandbox can't exceed
+Net for the requesting user: the blast radius is contained (the DinD sandbox can't exceed
 its pod memory/CPU), but "catch a specific inner container's leak from inside"
 is not possible — use one sandbox per workload instead.
 
@@ -97,7 +97,7 @@ is not possible — use one sandbox per workload instead.
 | Subdividing the pod limit *from inside* the sandbox | **No** | guest cgroupfs is cosmetic; unenforced (#306) |
 | Host-side enforcement of the pod's memory/CPU/pids cap | **Yes** (once #453 lands) | was a config bug, now fixed (#448); verified OOM-kill + throttle |
 | Per-workload limits for multi-workload users | **Via sandbox-level split** | one sandbox per workload (sandbawks enforces it), not carving one pod limit inside DinD |
-| Pre-OOM grace + capture logs before teardown | **Not yet — recommended** | the actual feature Greg's user wanted; tracked in #307, now unblocked |
+| Pre-OOM grace + capture logs before teardown | **Not yet — recommended** | the actual feature the requesting user wanted; tracked in #307, now unblocked |
 
 **Headline:** gVisor *can* contain sandbox resources once the cgroup driver is
 configured correctly — this was never an inherent gVisor limitation. What is
@@ -110,7 +110,7 @@ per-workload isolation should use one sandbox per workload.
   unblocked: with the sandbox correctly nested, the pod cgroup exposes working
   `memory.high` / `memory.events` / PSI. Set `memory.high` below `memory.max` for
   pre-OOM grace and have `sandbawks-node` watch the pressure signal to snapshot
-  logs before teardown. This is the deliverable for Greg's user's actual ask.
+  logs before teardown. This is the deliverable for the requesting user's actual ask.
 - **#450 — cross-runtime audit.** `kata-fc` / `runc-criu` likely share the same
   missing-systemd-cgroup-driver gap; audit and fix per #448's mechanism.
 - **#453 — land the real #448 fix** (re-closes #448).

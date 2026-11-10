@@ -1,11 +1,11 @@
 # gVisor in-sandbox cgroupfs support matrix (memory/OOM)
 
-Issue: #306 (parent #304 — Greg Bray feedback on memory-limit / OOM behavior
+Issue: #306 (parent #304 — external user feedback on memory-limit / OOM behavior
 under gVisor)
 
 ## Question
 
-Greg's user wanted to **subdivide the pod memory limit** or run a **userspace
+the requesting user wanted to **subdivide the pod memory limit** or run a **userspace
 `oomd`** from *inside* a sandbawks gVisor sandbox. This document turns that
 folklore into an empirically-tested support matrix for our pinned `runsc`:
 what `/sys/fs/cgroup` looks like inside the sandbox, which controllers exist,
@@ -101,7 +101,7 @@ memory.failcnt             = <file absent>
 VERDICT: NOT ENFORCED — no OOM kill at 4x the cap.
 ```
 
-The `v2` files Greg's user would reach for (`memory.max`, `memory.high`) do not
+The `v2` files the requesting user would reach for (`memory.max`, `memory.high`) do not
 exist; their v1 analogues (`memory.limit_in_bytes`, `memory.soft_limit_in_bytes`)
 are writable but unbacked by any reclaim/OOM path.
 

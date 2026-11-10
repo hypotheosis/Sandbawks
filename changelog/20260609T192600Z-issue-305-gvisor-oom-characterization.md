@@ -1,7 +1,7 @@
 # Issue #305 — Sandbox memory/OOM under gVisor: empirical characterization
 
 - **Date:** 2026-06-09T19:26:00Z
-- **Issue:** #305 (parent epic #304 — Greg Bray feedback on memory-limit / OOM behavior under gVisor)
+- **Issue:** #305 (parent epic #304 — external user feedback on memory-limit / OOM behavior under gVisor)
 - **Labels:** area/node, kind/test, prio/p2, runtime/gvisor
 - **Kind:** investigation / empirical characterization (no production code changed)
 
