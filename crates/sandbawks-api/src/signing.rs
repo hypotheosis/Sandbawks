@@ -77,6 +77,15 @@ pub struct SignedUrlPayload {
     /// `chrono::Utc::now().timestamp()` on verify; tokens whose `exp`
     /// is in the past are rejected as `invalid_token`.
     pub exp: i64,
+
+    /// Namespace of the sandbox the token authorises — the minting team's
+    /// namespace (issue #13). Sandbox ids are only unique within a
+    /// namespace, so the handler resolves `sandbox_id` here. `None` for a
+    /// token minted before this field existed; the handler then falls back to
+    /// the gateway's default namespace, the only one such a token could ever
+    /// reach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 /// Build a token authorising `payload`.

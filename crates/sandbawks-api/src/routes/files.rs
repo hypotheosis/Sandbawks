@@ -136,6 +136,7 @@ pub struct MintResponse {
 #[tracing::instrument(skip_all, name = "handler:files::mint_url")]
 async fn mint_url(
     State(state): State<AppState>,
+    Extension(team): Extension<TeamContext>,
     Json(req): Json<MintRequest>,
 ) -> AppResult<Json<MintResponse>> {
     let ttl = req.ttl.min(MAX_TTL_SECONDS);
@@ -155,6 +156,10 @@ async fn mint_url(
         path: req.path,
         method,
         exp: chrono::Utc::now().timestamp() + ttl as i64,
+        // Bind the URL to the caller's namespace (issue #13): the
+        // upload/download handler resolves the sandbox there, so a key can
+        // only mint URLs for its own team's sandboxes.
+        namespace: Some(team.namespace),
     };
     let token = mint(&state.signing_key, &payload);
     Ok(Json(MintResponse {
@@ -183,7 +188,11 @@ async fn upload(
             "token is not for PUT",
         ));
     }
-    let addr = envd_addr_for(&state, &state.default_namespace, &payload.sandbox_id).await?;
+    let namespace = payload
+        .namespace
+        .as_deref()
+        .unwrap_or(&state.default_namespace);
+    let addr = envd_addr_for(&state, namespace, &payload.sandbox_id).await?;
     let mut client = state.envd_pool.filesystem(&addr).await?;
 
     // Buffer the whole body up-front; see the module-level
@@ -224,7 +233,11 @@ async fn download(
             "token is not for GET",
         ));
     }
-    let addr = envd_addr_for(&state, &state.default_namespace, &payload.sandbox_id).await?;
+    let namespace = payload
+        .namespace
+        .as_deref()
+        .unwrap_or(&state.default_namespace);
+    let addr = envd_addr_for(&state, namespace, &payload.sandbox_id).await?;
     let mut client = state.envd_pool.filesystem(&addr).await?;
 
     let resp = client
@@ -242,13 +255,11 @@ async fn download(
 /// surfacing the same `envd_not_ready` upstream error the exec /
 /// events routes return when the sandbox has no envd address yet.
 ///
-/// `namespace` is a parameter rather than always-`state.default_namespace`
-/// because T11's token-authed handlers (`upload`, `download`) don't see
-/// a `TeamContext` — they have to fall back to the default namespace —
-/// but the T12 metadata routes run behind `auth_middleware` and pass
-/// the authenticated team's namespace through. Threading it as an
-/// argument keeps both call paths sharing the same "resolve sandbox +
-/// extract envdAddress" plumbing.
+/// `namespace` is a parameter because the two call paths learn it
+/// differently: T11's token-authed handlers (`upload`, `download`) have no
+/// `TeamContext` and read it from the signed token (issue #13), while the
+/// T12 metadata routes run behind `auth_middleware` and pass the
+/// authenticated team's namespace through.
 async fn envd_addr_for(state: &AppState, namespace: &str, sandbox_id: &str) -> AppResult<String> {
     let sandbox = state.sandbox_ops().get(namespace, sandbox_id).await?;
     sandbox

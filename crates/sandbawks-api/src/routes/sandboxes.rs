@@ -709,7 +709,9 @@ fn idle_baseline(sandbox: &Sandbox) -> Option<chrono::DateTime<Utc>> {
 /// Render a `Sandbox` CR as the E2B JSON DTO. `client_id` is the
 /// team's namespace (resolved from the request's `TeamContext`).
 /// `token_key` is the gateway signing key when the answer should carry the
-/// sandbox's `envdAccessToken` (create / connect / get), `None` for list.
+/// sandbox's `envdAccessToken` (create / connect / get), `None` for list. The
+/// token is bound to the sandbox's namespace (issue #13): its
+/// `metadata.namespace`, or the team's namespace when the object carries none.
 fn sandbox_to_dto(
     sandbox: &Sandbox,
     client_id: &str,
@@ -745,7 +747,10 @@ fn sandbox_to_dto(
         started_at,
         end_at,
         envd_version: ENVD_VERSION.to_owned(),
-        envd_access_token: token_key.map(|key| envd_access_token(key, &id)),
+        envd_access_token: token_key.map(|key| {
+            let namespace = sandbox.metadata.namespace.as_deref().unwrap_or(client_id);
+            envd_access_token(key, namespace, &id)
+        }),
         state,
         cpu_count: parse_cpu_count(&resources.cpu),
         memory_mb: parse_size_mb(&resources.memory),

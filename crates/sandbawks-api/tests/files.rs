@@ -86,3 +86,38 @@ async fn watch_requires_auth() {
 async fn mint_still_requires_auth() {
     assert_unauth(Method::POST, "/files/mint").await;
 }
+
+/// `/files/mint` binds the URL to the caller's team namespace (issue #13): the
+/// upload/download handler resolves the sandbox there, so a key can only
+/// mint URLs that reach its own team's sandboxes.
+#[tokio::test]
+async fn mint_binds_the_url_to_the_callers_namespace() {
+    let store = Arc::new(FakeKeyStore::default());
+    store.insert("sbk_teamb000xxxxxxxx", "team-b", &["sandboxes:*"]);
+    let state = AppState::for_test("team-acme", store);
+    let key = state.signing_key.clone();
+    let resp = files_router(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/files/mint")
+                .header("X-API-Key", "sbk_teamb000xxxxxxxx")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    r#"{"sandbox_id":"sbx-abc","path":"/tmp/x","method":"GET","ttl":60}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .expect("router serves request");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let url = json["url"].as_str().expect("url in response");
+    let token = url.split_once("token=").expect("token in url").1;
+    let payload = sandbawks_api::signing::verify(&key, token).expect("minted token verifies");
+    assert_eq!(payload.sandbox_id, "sbx-abc");
+    assert_eq!(payload.namespace.as_deref(), Some("team-b"));
+}

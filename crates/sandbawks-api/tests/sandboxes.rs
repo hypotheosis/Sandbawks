@@ -28,9 +28,10 @@ fn fixture_state() -> AppState {
     AppState::for_test("team-acme", store)
 }
 
-/// The `envdAccessToken` the gateway derives for `id` under the test key.
+/// The `envdAccessToken` the gateway derives for `id` under the test key:
+/// bound to the team's namespace (issue #13).
 fn expected_token(id: &str) -> String {
-    envd_access_token(&fixture_state().signing_key, id)
+    envd_access_token(&fixture_state().signing_key, "team-acme", id)
 }
 
 #[tokio::test]

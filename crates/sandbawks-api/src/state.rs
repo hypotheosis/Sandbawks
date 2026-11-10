@@ -134,12 +134,13 @@ impl AppState {
             SigningKey::from_env().expect("SANDBAWKS_SIGNING_SECRET must be set at startup"),
         );
         let default_namespace: Arc<str> = default_namespace.into();
-        // Spawn the Sandbox watcher scoped to the gateway's default
-        // namespace. `resolve_sandbox` looks sandboxes up there because
-        // per-sandbox envd calls carry no team identity (see
-        // `routes::envd_proxy`), so the cache shares that scope.
-        let envd_cache =
-            EnvdCache::spawn(Api::<Sandbox>::namespaced(kube.clone(), &default_namespace));
+        // Spawn the Sandbox watcher across every namespace (issue #13). A
+        // per-sandbox envd call carries no team identity, but its access
+        // token names the sandbox's namespace (see `envd_auth`), so the
+        // cache must cover every tenant namespace, not just the default.
+        // The gateway's ClusterRole already grants cluster-wide
+        // `sandboxes: get/list/watch`.
+        let envd_cache = EnvdCache::spawn(Api::<Sandbox>::all(kube.clone()));
         let warm_claim: Arc<dyn WarmClaim> = Arc::new(KubeWarmClaim::new(tenant_clients.clone()));
         // Bound the activity throttle map over the gateway's lifetime (#481
         // review): a periodic sweep drops entries for sandboxes idle longer
