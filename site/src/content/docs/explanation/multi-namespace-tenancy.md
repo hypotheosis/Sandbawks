@@ -68,15 +68,25 @@ sandboxes to route `envd` traffic.
 The controller doesn't delete a namespace's tenant ServiceAccount, Role, and
 RoleBinding when the last key for that namespace is removed.
 
-## Current limitation: envd traffic
+## How envd traffic finds its sandbox
 
 Calls that reach a sandbox's `envd`, such as file operations, commands, and
-terminals, carry no team identity, so the gateway looks the sandbox up in its
-default namespace (`api.defaultNamespace`, which is the installation's namespace
-by default). A sandbox in any other namespace isn't found for these calls
-([#13](https://github.com/hypotheosis/Sandbawks/issues/13)). Until that's fixed,
-tenant namespaces work for creating, listing, pausing, and deleting sandboxes,
-but the sandboxes that agents use must be in the gateway's default namespace.
+terminals, carry no API key, so the gateway can't take the namespace from a team.
+It takes it from the sandbox's access token instead. The `envdAccessToken` the
+gateway returns when a sandbox is created or connected is bound to the sandbox's
+namespace, and it names that namespace in front of its signature. The gateway
+checks the signature, which covers both the namespace and the sandbox ID, before
+it looks anything up, then finds the sandbox in that namespace.
+
+Sandbox names are only unique within a namespace, so this binding matters: a
+token for a sandbox in one namespace can never reach a sandbox with the same name
+in another. Signed file URLs work the same way. A URL minted with
+`/files/mint` carries the minting team's namespace, so a team can only mint URLs
+for its own sandboxes.
+
+Tokens issued before Sandbawks bound them to a namespace still work, but only for
+sandboxes in the gateway's default namespace, which is all they could reach
+before.
 
 ## See also
 
