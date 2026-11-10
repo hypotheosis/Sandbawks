@@ -555,7 +555,12 @@ pub struct FakeSandboxOps {
 
 #[async_trait]
 impl SandboxOps for FakeSandboxOps {
-    async fn create(&self, _ns: &str, mut sandbox: Sandbox) -> Result<Sandbox, AppError> {
+    async fn create(&self, ns: &str, mut sandbox: Sandbox) -> Result<Sandbox, AppError> {
+        // Record the namespace the sandbox was created in, as the apiserver
+        // would, so `get` can resolve it per namespace (issue #13).
+        if sandbox.metadata.namespace.is_none() {
+            sandbox.metadata.namespace = Some(ns.to_owned());
+        }
         // Stamp a creation timestamp if one isn't already set so
         // downstream `sandbox_to_dto` can render a stable `startedAt`.
         if sandbox.metadata.creation_timestamp.is_none() {
@@ -616,12 +621,16 @@ impl SandboxOps for FakeSandboxOps {
         Ok(())
     }
 
-    async fn get(&self, _ns: &str, name: &str) -> Result<Sandbox, AppError> {
+    async fn get(&self, ns: &str, name: &str) -> Result<Sandbox, AppError> {
+        // Names are only unique per namespace (issue #13): match both.
         self.inner
             .lock()
             .await
             .iter()
-            .find(|s| s.metadata.name.as_deref() == Some(name))
+            .find(|s| {
+                s.metadata.name.as_deref() == Some(name)
+                    && s.metadata.namespace.as_deref() == Some(ns)
+            })
             .cloned()
             .ok_or_else(|| AppError::not_found("sandbox_not_found", name.to_owned()))
     }
@@ -709,7 +718,9 @@ fn idle_baseline(sandbox: &Sandbox) -> Option<chrono::DateTime<Utc>> {
 /// Render a `Sandbox` CR as the E2B JSON DTO. `client_id` is the
 /// team's namespace (resolved from the request's `TeamContext`).
 /// `token_key` is the gateway signing key when the answer should carry the
-/// sandbox's `envdAccessToken` (create / connect / get), `None` for list.
+/// sandbox's `envdAccessToken` (create / connect / get), `None` for list. The
+/// token is bound to the sandbox's namespace (issue #13): its
+/// `metadata.namespace`, or the team's namespace when the object carries none.
 fn sandbox_to_dto(
     sandbox: &Sandbox,
     client_id: &str,
@@ -745,7 +756,10 @@ fn sandbox_to_dto(
         started_at,
         end_at,
         envd_version: ENVD_VERSION.to_owned(),
-        envd_access_token: token_key.map(|key| envd_access_token(key, &id)),
+        envd_access_token: token_key.map(|key| {
+            let namespace = sandbox.metadata.namespace.as_deref().unwrap_or(client_id);
+            envd_access_token(key, namespace, &id)
+        }),
         state,
         cpu_count: parse_cpu_count(&resources.cpu),
         memory_mb: parse_size_mb(&resources.memory),

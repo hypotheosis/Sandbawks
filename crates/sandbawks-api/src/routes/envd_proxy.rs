@@ -176,11 +176,44 @@ enum Access<'a> {
     TokenOrSignature(FileRequest<'a>),
 }
 
-/// Reject the request unless it carries `sandbox_id`'s credential.
+/// A sandbox a request resolved to: its namespace and id (issue #13).
 ///
-/// Runs before the sandbox is looked up, so an unauthenticated caller gets the
-/// same `401` whether or not the id exists. Either credential is enough, as in
-/// envd: a wrong `X-Access-Token` does not veto a valid `/files` signature.
+/// Sandbox ids are only unique within a namespace, so every per-sandbox
+/// lookup, wait and activity stamp is keyed by both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SandboxRef {
+    /// `metadata.namespace` — taken from the request's credential.
+    namespace: String,
+    /// `metadata.name` — taken from the request's host or header.
+    id: String,
+}
+
+/// Test shorthand: a bare id in the `default` namespace, for the pure
+/// branch-table tests that never resolve a namespace.
+#[cfg(test)]
+impl From<&str> for SandboxRef {
+    fn from(id: &str) -> Self {
+        Self {
+            namespace: "default".to_owned(),
+            id: id.to_owned(),
+        }
+    }
+}
+
+/// Reject the request unless it carries `sandbox_id`'s credential, and return
+/// the namespace that credential is for (issue #13).
+///
+/// Runs before the sandbox is looked up in the apiserver, so an
+/// unauthenticated caller gets the same `401` whether or not the id exists.
+/// Either credential is enough, as in envd: a wrong `X-Access-Token` does not
+/// veto a valid `/files` signature.
+///
+/// An access token names its namespace (see [`envd_auth`]). A `/files`
+/// signature does not, so it is checked against the token of each namespace
+/// the [`crate::envd_cache::EnvdCache`] holds a sandbox of that id in, plus
+/// the legacy token for the default namespace. That is an in-memory read, and
+/// a signature that matches none of them is the same `401` whether or not any
+/// candidate exists.
 ///
 /// # Errors
 ///
@@ -191,22 +224,35 @@ fn authorize(
     sandbox_id: &str,
     headers: &HeaderMap,
     access: Access<'_>,
-) -> AppResult<()> {
+) -> AppResult<String> {
     let key = &state.signing_key;
     let token = headers
         .get(HEADER_ACCESS_TOKEN)
         .and_then(|v| v.to_str().ok());
-    if token.is_some_and(|t| envd_auth::verify_access_token(key, sandbox_id, t)) {
-        return Ok(());
+    if let Some(namespace) = token
+        .and_then(|t| envd_auth::verify_access_token(key, sandbox_id, t, &state.default_namespace))
+    {
+        return Ok(namespace.to_owned());
     }
     match access {
         Access::TokenOrSignature(request) if request.signature.is_some() => {
-            envd_auth::verify_file_signature(
-                key,
-                sandbox_id,
-                &request,
-                chrono::Utc::now().timestamp(),
-            )
+            let now = chrono::Utc::now().timestamp();
+            let candidates = state.envd_cache.namespaces_of(sandbox_id);
+            let mut last_err = None;
+            for namespace in candidates {
+                let token = envd_auth::envd_access_token(key, &namespace, sandbox_id);
+                match envd_auth::verify_file_signature(&token, &request, now) {
+                    Ok(()) => return Ok(namespace),
+                    Err(err) => last_err = Some(err),
+                }
+            }
+            let legacy = envd_auth::legacy_envd_access_token(key, sandbox_id);
+            match envd_auth::verify_file_signature(&legacy, &request, now) {
+                Ok(()) => Ok(state.default_namespace.to_string()),
+                // Prefer a namespaced candidate's error: it's the more specific
+                // one (e.g. "signature expired" for a real sandbox).
+                Err(err) => Err(last_err.unwrap_or(err)),
+            }
         }
         Access::Token | Access::TokenOrSignature(_) => Err(AppError::unauthorized(
             "invalid_access_token",
@@ -299,14 +345,14 @@ fn sleep_honor_max() -> std::time::Duration {
 /// synthetic stderr frame for the streaming process handlers, or a distinct
 /// `sandbox_not_ready` / `sandbox_failed` error code for the unary handlers.
 enum Resolved {
-    /// The sandbox is serving — route to `addr`. `sandbox_id` feeds the
+    /// The sandbox is serving — route to `addr`. `sandbox` feeds the
     /// idle-timeout activity stamp on the work paths.
-    Ready { addr: String, sandbox_id: String },
+    Ready { addr: String, sandbox: SandboxRef },
     /// The sandbox is not (yet) serving — still starting/restoring, or in a
     /// terminal state that will not recover without intervention.
     NotReady {
         #[allow(dead_code)]
-        sandbox_id: String,
+        sandbox: SandboxRef,
         detail: NotReady,
     },
 }
@@ -317,7 +363,7 @@ enum Resolved {
 /// `proc_start` branch a leading `sleep` to the synthetic keepalive park
 /// before any silent wait, while the unary/connect paths still park.
 struct Classification {
-    sandbox_id: String,
+    sandbox: SandboxRef,
     requested_port: Option<String>,
     readiness: Readiness,
 }
@@ -327,17 +373,18 @@ async fn classify_sandbox(
     headers: &HeaderMap,
     access: Access<'_>,
 ) -> AppResult<Classification> {
-    let (sandbox_id, requested_port) = resolve_target(state, headers)?;
-    authorize(state, &sandbox_id, headers, access)?;
-    let cached = match state.envd_cache.lookup(&sandbox_id) {
+    let (id, requested_port) = resolve_target(state, headers)?;
+    let namespace = authorize(state, &id, headers, access)?;
+    let sandbox = SandboxRef { namespace, id };
+    let cached = match state.envd_cache.lookup(&sandbox.namespace, &sandbox.id) {
         Some(cached) => Some(cached),
         None => {
-            let sandbox = state
+            let fetched = state
                 .sandbox_ops()
-                .get(&state.default_namespace, &sandbox_id)
+                .get(&sandbox.namespace, &sandbox.id)
                 .await?;
-            state.envd_cache.seed_if_absent(&sandbox);
-            state.envd_cache.lookup(&sandbox_id)
+            state.envd_cache.seed_if_absent(&fetched);
+            state.envd_cache.lookup(&sandbox.namespace, &sandbox.id)
         }
     };
     // An empty cache after a successful `get` (degenerate empty-named CR) is
@@ -355,7 +402,7 @@ async fn classify_sandbox(
         })
     });
     Ok(Classification {
-        sandbox_id,
+        sandbox,
         requested_port,
         readiness,
     })
@@ -381,18 +428,18 @@ async fn resolve_sandbox_outcome(
     access: Access<'_>,
 ) -> AppResult<Resolved> {
     let Classification {
-        sandbox_id,
+        sandbox,
         requested_port,
         readiness,
     } = classify_sandbox(state, headers, access).await?;
     match readiness {
         Readiness::Ready(addr) => {
-            warn_on_port_mismatch(&sandbox_id, &addr, requested_port.as_deref());
-            Ok(Resolved::Ready { addr, sandbox_id })
+            warn_on_port_mismatch(&sandbox.id, &addr, requested_port.as_deref());
+            Ok(Resolved::Ready { addr, sandbox })
         }
         Readiness::Paused => Err(sandbox_paused_error()),
         Readiness::NotReady(detail) if detail.terminal => {
-            Ok(Resolved::NotReady { sandbox_id, detail })
+            Ok(Resolved::NotReady { sandbox, detail })
         }
         // Transient, but the backing Pod cannot plausibly serve within the
         // silent window (unscheduled / capacity-`Pending`): surface the notice
@@ -404,37 +451,37 @@ async fn resolve_sandbox_outcome(
         // `NotReady::can_serve_within_silent_window` is the single source of
         // truth for the predicate itself.
         Readiness::NotReady(detail) if !detail.can_serve_within_silent_window() => {
-            Ok(Resolved::NotReady { sandbox_id, detail })
+            Ok(Resolved::NotReady { sandbox, detail })
         }
         Readiness::NotReady(_) => {
             let deadline = tokio::time::Instant::now() + silent_park_max();
-            park_for_address(state, sandbox_id, requested_port.as_deref(), deadline).await
+            park_for_address(state, sandbox, requested_port.as_deref(), deadline).await
         }
     }
 }
 
-/// Park on the cache until `sandbox_id` becomes resolvable or `deadline`
+/// Park on the cache until `sandbox` becomes resolvable or `deadline`
 /// elapses, mapping the [`WaitOutcome`] into a [`Resolved`].
 async fn park_for_address(
     state: &AppState,
-    sandbox_id: String,
+    sandbox: SandboxRef,
     requested_port: Option<&str>,
     deadline: tokio::time::Instant,
 ) -> AppResult<Resolved> {
     match state
         .envd_cache
-        .wait_until_ready(&sandbox_id, deadline)
+        .wait_until_ready(&sandbox.namespace, &sandbox.id, deadline)
         .await
     {
         WaitOutcome::Ready(addr) => {
-            warn_on_port_mismatch(&sandbox_id, &addr, requested_port);
-            Ok(Resolved::Ready { addr, sandbox_id })
+            warn_on_port_mismatch(&sandbox.id, &addr, requested_port);
+            Ok(Resolved::Ready { addr, sandbox })
         }
         WaitOutcome::Paused => Err(sandbox_paused_error()),
         // A mid-wait terminal state and a transient timeout both surface as a
         // notice; `detail.terminal` distinguishes "give up" from "retry".
         WaitOutcome::Terminal(detail) | WaitOutcome::TimedOut(detail) => {
-            Ok(Resolved::NotReady { sandbox_id, detail })
+            Ok(Resolved::NotReady { sandbox, detail })
         }
     }
 }
@@ -552,8 +599,8 @@ async fn resolve_sandbox(
     access: Access<'_>,
 ) -> AppResult<String> {
     match resolve_sandbox_outcome(state, headers, access).await? {
-        Resolved::Ready { addr, sandbox_id } => {
-            state.note_activity(&sandbox_id);
+        Resolved::Ready { addr, sandbox } => {
+            state.note_activity(&sandbox.namespace, &sandbox.id);
             Ok(addr)
         }
         Resolved::NotReady { detail, .. } => Err(not_ready_error(&detail)),
@@ -1612,7 +1659,7 @@ enum ProcStartMode {
     /// Sandbox is serving — proxy the command verbatim.
     Proxy {
         addr: String,
-        sandbox_id: String,
+        sandbox: SandboxRef,
         requested_port: Option<String>,
     },
     /// `spec.desiredPhase == Paused` — reject with `sandbox_paused`.
@@ -1627,10 +1674,10 @@ enum ProcStartMode {
     /// the caller is told to keep retrying, not to give up.
     ImmediateNotice(NotReady),
     /// Transient not-ready + a leading `sleep` — synthetic keepalive re-signal.
-    SleepPark { sandbox_id: String },
+    SleepPark { sandbox: SandboxRef },
     /// Transient not-ready, no leading `sleep` — bounded silent park.
     SilentPark {
-        sandbox_id: String,
+        sandbox: SandboxRef,
         requested_port: Option<String>,
     },
 }
@@ -1640,14 +1687,14 @@ enum ProcStartMode {
 /// table is unit-testable; see [`ProcStartMode`] for the ordering invariant.
 fn proc_start_mode(
     readiness: Readiness,
-    sandbox_id: String,
+    sandbox: SandboxRef,
     requested_port: Option<String>,
     has_leading_sleep: bool,
 ) -> ProcStartMode {
     match readiness {
         Readiness::Ready(addr) => ProcStartMode::Proxy {
             addr,
-            sandbox_id,
+            sandbox,
             requested_port,
         },
         Readiness::Paused => ProcStartMode::Paused,
@@ -1656,7 +1703,7 @@ fn proc_start_mode(
         // and re-signal (issue #641/#646); honor it even for a `Pending` Pod —
         // the connection is held alive and the agent is told to resend, which
         // is strictly better than an immediate retry bounce.
-        Readiness::NotReady(_) if has_leading_sleep => ProcStartMode::SleepPark { sandbox_id },
+        Readiness::NotReady(_) if has_leading_sleep => ProcStartMode::SleepPark { sandbox },
         // Transient, plain command: if the backing Pod cannot plausibly serve
         // within the silent window (unscheduled / capacity-`Pending`), emit the
         // transient NOTICE *immediately* so a short-timeout readiness poller
@@ -1672,7 +1719,7 @@ fn proc_start_mode(
         // p95-readies within seconds) keep the bounded silent park so the call
         // proxies transparently once envd comes up.
         Readiness::NotReady(_) => ProcStartMode::SilentPark {
-            sandbox_id,
+            sandbox,
             requested_port,
         },
     }
@@ -1715,66 +1762,63 @@ async fn proc_start(
     // not-ready sandbox routes to the synthetic keepalive park, while a plain
     // command keeps the bounded silent park + #625 notice.
     let Classification {
-        sandbox_id,
+        sandbox,
         requested_port,
         readiness,
     } = classify_sandbox(&state, &headers, Access::Token).await?;
 
-    let (addr, sandbox_id) = match proc_start_mode(
-        readiness,
-        sandbox_id,
-        requested_port,
-        honored_sleep.is_some(),
-    ) {
-        ProcStartMode::Proxy {
-            addr,
-            sandbox_id,
-            requested_port,
-        } => {
-            warn_on_port_mismatch(&sandbox_id, &addr, requested_port.as_deref());
-            (addr, sandbox_id)
-        }
-        ProcStartMode::Paused => return Err(ConnectErr::from(sandbox_paused_error())),
-        ProcStartMode::TerminalNotice(detail) => {
-            return Ok(synthetic_notice_response(&detail));
-        }
-        ProcStartMode::ImmediateNotice(detail) => {
-            // Transient not-ready whose Pod is unscheduled / capacity-`Pending`:
-            // emit the `NOTICE` (`exit 75`, retry shortly) now rather than after
-            // the silent park, so a sub-15s readiness poller sees it (#649).
-            return Ok(synthetic_notice_response(&detail));
-        }
-        ProcStartMode::SleepPark { sandbox_id } => {
-            // Transient not-ready + leading `sleep`: honored as a
-            // keepalive-protected park that re-signals the agent to resend;
-            // the command is never proxied from this call.
-            let sleep =
-                honored_sleep.expect("SleepPark mode is only chosen when a sleep was parsed");
-            return Ok(sleep_park_response(
-                state.clone(),
-                sandbox_id,
-                sleep,
-                sleep_honor_max(),
-            ));
-        }
-        ProcStartMode::SilentPark {
-            sandbox_id,
-            requested_port,
-        } => {
-            // Bounded silent park — 15s for all phases now; cold-start "SDK
-            // transparency" is handled by the sleep Mode B re-signal, not a
-            // long silent park. Then proxy if it readied, else notice.
-            let deadline = tokio::time::Instant::now() + silent_park_max();
-            match park_for_address(&state, sandbox_id, requested_port.as_deref(), deadline).await? {
-                Resolved::Ready { addr, sandbox_id } => (addr, sandbox_id),
-                Resolved::NotReady { detail, .. } => {
-                    return Ok(synthetic_notice_response(&detail));
+    let (addr, sandbox) =
+        match proc_start_mode(readiness, sandbox, requested_port, honored_sleep.is_some()) {
+            ProcStartMode::Proxy {
+                addr,
+                sandbox,
+                requested_port,
+            } => {
+                warn_on_port_mismatch(&sandbox.id, &addr, requested_port.as_deref());
+                (addr, sandbox)
+            }
+            ProcStartMode::Paused => return Err(ConnectErr::from(sandbox_paused_error())),
+            ProcStartMode::TerminalNotice(detail) => {
+                return Ok(synthetic_notice_response(&detail));
+            }
+            ProcStartMode::ImmediateNotice(detail) => {
+                // Transient not-ready whose Pod is unscheduled / capacity-`Pending`:
+                // emit the `NOTICE` (`exit 75`, retry shortly) now rather than after
+                // the silent park, so a sub-15s readiness poller sees it (#649).
+                return Ok(synthetic_notice_response(&detail));
+            }
+            ProcStartMode::SleepPark { sandbox } => {
+                // Transient not-ready + leading `sleep`: honored as a
+                // keepalive-protected park that re-signals the agent to resend;
+                // the command is never proxied from this call.
+                let sleep =
+                    honored_sleep.expect("SleepPark mode is only chosen when a sleep was parsed");
+                return Ok(sleep_park_response(
+                    state.clone(),
+                    sandbox,
+                    sleep,
+                    sleep_honor_max(),
+                ));
+            }
+            ProcStartMode::SilentPark {
+                sandbox,
+                requested_port,
+            } => {
+                // Bounded silent park — 15s for all phases now; cold-start "SDK
+                // transparency" is handled by the sleep Mode B re-signal, not a
+                // long silent park. Then proxy if it readied, else notice.
+                let deadline = tokio::time::Instant::now() + silent_park_max();
+                match park_for_address(&state, sandbox, requested_port.as_deref(), deadline).await?
+                {
+                    Resolved::Ready { addr, sandbox } => (addr, sandbox),
+                    Resolved::NotReady { detail, .. } => {
+                        return Ok(synthetic_notice_response(&detail));
+                    }
                 }
             }
-        }
-    };
+        };
 
-    state.note_activity(&sandbox_id);
+    state.note_activity(&sandbox.namespace, &sandbox.id);
     // `process_streaming` — deadline-free channel so a long-running
     // `commands.run(...)` (or its `.wait()`) is not cut off by the
     // unary 30s `grpc-timeout`. See `EnvdPool::streaming_channel`.
@@ -1784,7 +1828,7 @@ async fn proc_start(
         stream,
         Some(StreamActivity {
             state: state.clone(),
-            sandbox_id,
+            sandbox,
         }),
     ))
 }
@@ -1802,11 +1846,11 @@ async fn proc_connect(
     // to a long-running background command via `.wait()` keeps the sandbox
     // active for the life of the stream. A not-ready sandbox yields the same
     // synthetic stderr NOTICE stream as `proc_start` (issue #625).
-    let (addr, sandbox_id) = match resolve_sandbox_outcome(&state, &headers, Access::Token).await? {
-        Resolved::Ready { addr, sandbox_id } => (addr, sandbox_id),
+    let (addr, sandbox) = match resolve_sandbox_outcome(&state, &headers, Access::Token).await? {
+        Resolved::Ready { addr, sandbox } => (addr, sandbox),
         Resolved::NotReady { detail, .. } => return Ok(synthetic_notice_response(&detail)),
     };
-    state.note_activity(&sandbox_id);
+    state.note_activity(&sandbox.namespace, &sandbox.id);
     let raw = read_body_bytes(body).await?;
     let inner = decode_stream_request_envelope(&raw)?;
     let req: ConnectReqDto = if inner.is_empty() {
@@ -1829,7 +1873,7 @@ async fn proc_connect(
         stream,
         Some(StreamActivity {
             state: state.clone(),
-            sandbox_id,
+            sandbox,
         }),
     ))
 }
@@ -1939,13 +1983,14 @@ fn map_process_event(ev: process_event::Event) -> ProcessEventInner {
 /// in unit tests that exercise only the keepalive timing.
 struct StreamActivity {
     state: AppState,
-    sandbox_id: String,
+    sandbox: SandboxRef,
 }
 
 impl StreamActivity {
     /// Refresh the activity stamp for this stream's sandbox (throttled).
     fn note(&self) {
-        self.state.note_activity(&self.sandbox_id);
+        self.state
+            .note_activity(&self.sandbox.namespace, &self.sandbox.id);
     }
 }
 
@@ -2376,7 +2421,7 @@ async fn run_sleep_park<F>(
 /// # Arguments
 ///
 /// * `state` - Application state providing the [`EnvdCache`] waiter.
-/// * `sandbox_id` - The sandbox to wait on.
+/// * `sandbox` - The sandbox to wait on.
 /// * `sleep` - How long the client's leading `sleep` asked to wait.
 /// * `cap` - Maximum allowed park window (operator-configured ceiling).
 ///
@@ -2386,7 +2431,7 @@ async fn run_sleep_park<F>(
 /// [`PROC_KEEPALIVE_INTERVAL`] while parked, then a terminal notice frame.
 fn sleep_park_response(
     state: AppState,
-    sandbox_id: String,
+    sandbox: SandboxRef,
     sleep: std::time::Duration,
     cap: std::time::Duration,
 ) -> Response {
@@ -2394,7 +2439,10 @@ fn sleep_park_response(
     let park = park_window(sleep, cap);
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + park;
-        let readiness = state.envd_cache.wait_until_ready(&sandbox_id, deadline);
+        let readiness =
+            state
+                .envd_cache
+                .wait_until_ready(&sandbox.namespace, &sandbox.id, deadline);
         run_sleep_park(tx, readiness, PROC_KEEPALIVE_INTERVAL).await;
     });
     let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));

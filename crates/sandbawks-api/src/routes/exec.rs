@@ -251,12 +251,13 @@ async fn exec(
     // momentarily silent — is not paused out from under the client. Unlike
     // the Connect-RPC proxy this WS surface has no per-request seam, so the
     // heartbeat is how "open stream counts as active" is honored here.
-    state.note_activity(&id);
+    state.note_activity(&team.namespace, &id);
 
     let pool = state.envd_pool.clone();
     let pty = query.pty;
     let activity_state = state.clone();
     let activity_id = id.clone();
+    let activity_namespace = team.namespace.clone();
     Ok(ws.on_upgrade(move |socket| async move {
         // Refresh the idle stamp until the session ends. `note_activity` is
         // throttled and fire-and-forget, so an idle tick is cheap; the task is
@@ -266,7 +267,7 @@ async fn exec(
             let mut tick = tokio::time::interval(EXEC_ACTIVITY_HEARTBEAT);
             loop {
                 tick.tick().await;
-                activity_state.note_activity(&activity_id);
+                activity_state.note_activity(&activity_namespace, &activity_id);
             }
         });
         run_exec(socket, pool, envd_address, pty).await;

@@ -18,7 +18,7 @@ use axum::http::{Request, StatusCode};
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
 use sandbawks_api::auth::FakeKeyStore;
-use sandbawks_api::envd_auth::envd_access_token;
+use sandbawks_api::envd_auth::{envd_access_token, legacy_envd_access_token};
 use sandbawks_api::routes::envd_proxy::{
     unauthenticated_streaming_router, unauthenticated_unary_router,
 };
@@ -33,7 +33,7 @@ const SANDBOX_ID: &str = "sbx-does-not-exist";
 /// misses, which is exactly what the not-found path below asserts.
 fn proxy_state() -> AppState {
     let store = Arc::new(FakeKeyStore::default());
-    AppState::for_test("team-acme", store)
+    AppState::for_test(NAMESPACE, store)
 }
 
 /// Same, but with hostname-based selection enabled for a wildcard
@@ -42,9 +42,19 @@ fn proxy_state_with_domain() -> AppState {
     proxy_state().with_sandbox_domain(Some(Arc::from("e2b.example.com")))
 }
 
-/// The `envdAccessToken` the gateway would hand out for [`SANDBOX_ID`].
+/// Namespace the test gateway runs in (its default namespace).
+const NAMESPACE: &str = "team-acme";
+
+/// The `envdAccessToken` the gateway would hand out for [`SANDBOX_ID`] in
+/// [`NAMESPACE`].
 fn token(state: &AppState) -> String {
-    envd_access_token(&state.signing_key, SANDBOX_ID)
+    envd_access_token(&state.signing_key, NAMESPACE, SANDBOX_ID)
+}
+
+/// The pre-#13, namespace-less token for [`SANDBOX_ID`]. Still accepted, for
+/// the gateway's default namespace only.
+fn legacy_token(state: &AppState) -> String {
+    legacy_envd_access_token(&state.signing_key, SANDBOX_ID)
 }
 
 /// A v1 `/files` signature, computed the way the E2B SDK's
@@ -199,7 +209,7 @@ async fn health_without_access_token_returns_401() {
 #[tokio::test]
 async fn wrong_access_token_returns_401() {
     let state = proxy_state();
-    let other = envd_access_token(&state.signing_key, "sbx-someone-else");
+    let other = envd_access_token(&state.signing_key, NAMESPACE, "sbx-someone-else");
     let request = Request::builder()
         .method("POST")
         .uri("/filesystem.Filesystem/Stat")
@@ -234,7 +244,7 @@ async fn unsigned_files_upload_without_token_returns_401() {
 async fn signed_files_download_passes_auth() {
     let state = proxy_state();
     let exp = chrono::Utc::now().timestamp() + 300;
-    let sig = sdk_signature("/tmp/up.txt", "read", &token(&state), Some(exp));
+    let sig = sdk_signature("/tmp/up.txt", "read", &legacy_token(&state), Some(exp));
     let request = Request::builder()
         .method("GET")
         .uri(format!(
@@ -251,7 +261,7 @@ async fn signed_files_download_passes_auth() {
 #[tokio::test]
 async fn read_signature_does_not_authorise_upload() {
     let state = proxy_state();
-    let sig = sdk_signature("/tmp/up.txt", "read", &token(&state), None);
+    let sig = sdk_signature("/tmp/up.txt", "read", &legacy_token(&state), None);
     let request = Request::builder()
         .method("POST")
         .uri(format!(
@@ -287,7 +297,7 @@ async fn stripped_signature_returns_401() {
 async fn expired_signature_returns_401() {
     let state = proxy_state();
     let exp = chrono::Utc::now().timestamp() - 1;
-    let sig = sdk_signature("/tmp/up.txt", "read", &token(&state), Some(exp));
+    let sig = sdk_signature("/tmp/up.txt", "read", &legacy_token(&state), Some(exp));
     let request = Request::builder()
         .method("GET")
         .uri(format!(
@@ -398,9 +408,9 @@ const SDK_FILE_QUERIES: [(&str, &str); 8] = [
 async fn real_sdk_signed_urls_pass_auth() {
     let state = proxy_state();
     assert_eq!(
-        token(&state),
+        legacy_token(&state),
         "2qDQP2X1AE2byUqjeUOSRxIaHE1cm6FLZZy3ct-Kghg",
-        "vectors were generated for this token",
+        "vectors were generated for this (legacy, default-namespace) token",
     );
     for (method, query) in SDK_FILE_QUERIES {
         let request = Request::builder()
@@ -416,4 +426,160 @@ async fn real_sdk_signed_urls_pass_auth() {
             "SDK URL rejected: {method} {query}",
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tenant namespaces (issue #13). Sandbox ids are only unique per namespace;
+// the access token names the namespace, and the proxy resolves the sandbox
+// there rather than in the gateway's default namespace.
+// ---------------------------------------------------------------------------
+
+/// A `Sandbox` named `id` in `namespace`, with an optional envd address and
+/// desired phase, for seeding the proxy's cache.
+fn cached_sandbox(
+    namespace: &str,
+    id: &str,
+    desired: Option<sandbawks_types::SandboxPhase>,
+    addr: Option<&str>,
+) -> sandbawks_types::Sandbox {
+    use sandbawks_types::{
+        ResourceQuantity, ResourceRequests, Sandbox, SandboxSpec, SandboxStatus,
+    };
+    let spec = SandboxSpec {
+        template_ref: "tpl".to_owned(),
+        runtime_class_name: None,
+        resources: ResourceRequests {
+            cpu: "1".parse::<ResourceQuantity>().unwrap(),
+            memory: "512Mi".parse::<ResourceQuantity>().unwrap(),
+            ephemeral_storage: None,
+        },
+        timeout_seconds: 60,
+        auto_pause: false,
+        env: Default::default(),
+        metadata: Default::default(),
+        network_policy: None,
+        desired_phase: desired,
+        snapshot_retention: None,
+        pvc_retention: None,
+        tolerations: None,
+        node_selector: None,
+        security_context: None,
+        persistence_mode: None,
+        volume_claim_templates: None,
+        restore_from: None,
+    };
+    let mut sandbox = Sandbox::new(id, spec);
+    sandbox.metadata.namespace = Some(namespace.to_owned());
+    sandbox.status = addr.map(|a| SandboxStatus {
+        envd_address: Some(a.to_owned()),
+        ..Default::default()
+    });
+    sandbox
+}
+
+/// `GET /health` for [`SANDBOX_ID`] with `token`, returning the status.
+async fn health_status(state: AppState, token: &str) -> StatusCode {
+    let request = Request::builder()
+        .method("GET")
+        .uri("/health")
+        .header("E2b-Sandbox-Id", SANDBOX_ID)
+        .header("X-Access-Token", token)
+        .body(Body::empty())
+        .unwrap();
+    unary_status(state, request).await
+}
+
+/// A token issued for a tenant namespace other than the gateway's default
+/// passes auth and the sandbox is resolved *in that namespace*: a paused
+/// sandbox cached there answers `sandbox_paused` (403), where the old
+/// default-namespace-only lookup answered 404.
+#[tokio::test]
+async fn tenant_namespace_token_resolves_in_its_namespace() {
+    let state = proxy_state();
+    state.envd_cache.apply(&cached_sandbox(
+        "team-b",
+        SANDBOX_ID,
+        Some(sandbawks_types::SandboxPhase::Paused),
+        None,
+    ));
+    let token = envd_access_token(&state.signing_key, "team-b", SANDBOX_ID);
+    assert_eq!(health_status(state, &token).await, StatusCode::FORBIDDEN);
+}
+
+/// The same sandbox id in two namespaces: team-b's token never reaches
+/// team-a's sandbox. Team-a's copy is cached as paused (403 if it were
+/// reached); team-b has none, so the lookup misses and answers 404.
+#[tokio::test]
+async fn token_does_not_reach_the_same_id_in_another_namespace() {
+    let state = proxy_state();
+    state.envd_cache.apply(&cached_sandbox(
+        "team-a",
+        SANDBOX_ID,
+        Some(sandbawks_types::SandboxPhase::Paused),
+        None,
+    ));
+    let token = envd_access_token(&state.signing_key, "team-b", SANDBOX_ID);
+    assert_eq!(health_status(state, &token).await, StatusCode::NOT_FOUND);
+}
+
+/// A token whose namespace label was swapped fails the MAC: 401.
+#[tokio::test]
+async fn relabelled_token_returns_401() {
+    let state = proxy_state();
+    let token = envd_access_token(&state.signing_key, "team-a", SANDBOX_ID);
+    let forged = format!("team-b.{}", token.split_once('.').unwrap().1);
+    assert_eq!(
+        health_status(state, &forged).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// A legacy, namespace-less token keeps working for the default namespace
+/// (clients that connected before the upgrade), and only there.
+#[tokio::test]
+async fn legacy_token_is_scoped_to_the_default_namespace() {
+    let state = proxy_state();
+    // Default namespace: passes auth, misses the empty store → 404.
+    assert_eq!(
+        health_status(state.clone(), &legacy_token(&state)).await,
+        StatusCode::NOT_FOUND
+    );
+    // A paused sandbox of that id in another namespace is not reachable
+    // with it: still 404 (looked up in the default namespace), never 403.
+    state.envd_cache.apply(&cached_sandbox(
+        "team-b",
+        SANDBOX_ID,
+        Some(sandbawks_types::SandboxPhase::Paused),
+        None,
+    ));
+    assert_eq!(
+        health_status(state.clone(), &legacy_token(&state)).await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// A signed `/files` URL carries no namespace; the proxy checks the signature
+/// against each namespace the cache holds that id in. A URL signed with
+/// team-b's token resolves in team-b (paused → 403, not 401).
+#[tokio::test]
+async fn signed_url_resolves_the_namespace_from_the_cache() {
+    let state = proxy_state();
+    state.envd_cache.apply(&cached_sandbox(
+        "team-b",
+        SANDBOX_ID,
+        Some(sandbawks_types::SandboxPhase::Paused),
+        None,
+    ));
+    let token = envd_access_token(&state.signing_key, "team-b", SANDBOX_ID);
+    let sig = sdk_signature("/tmp/up.txt", "read", &token, None);
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/files?path=/tmp/up.txt&signature={}",
+            urlencode(&sig)
+        ))
+        .header("E2b-Sandbox-Id", SANDBOX_ID)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(unary_status(state, request).await, StatusCode::FORBIDDEN);
 }

@@ -64,7 +64,9 @@ const EVICTION_INTERVAL: Duration = Duration::from_secs(60);
 /// `AppState` (the backing [`DashMap`] is shared behind an `Arc`).
 #[derive(Clone, Default)]
 pub struct ActivityStamper {
-    /// `sandbox_id -> instant of the last stamp we let through`.
+    /// `"<namespace>/<sandbox_id>" -> instant of the last stamp we let
+    /// through`. Namespaced because sandbox names are only unique per
+    /// namespace (issue #13); `/` can appear in neither part.
     last: Arc<DashMap<String, Instant>>,
 }
 
@@ -142,12 +144,15 @@ impl AppState {
     /// realistic idle window, so a single dropped stamp never causes a
     /// premature pause; the failure is logged at debug and self-heals on the
     /// next due request.
-    pub fn note_activity(&self, sandbox_id: &str) {
-        if !self.activity.due(sandbox_id, Instant::now()) {
+    pub fn note_activity(&self, namespace: &str, sandbox_id: &str) {
+        if !self
+            .activity
+            .due(&format!("{namespace}/{sandbox_id}"), Instant::now())
+        {
             return;
         }
         let ops = Arc::clone(self.sandbox_ops());
-        let namespace = Arc::clone(&self.default_namespace);
+        let namespace = namespace.to_owned();
         let id = sandbox_id.to_owned();
         tokio::spawn(async move {
             let now = Utc::now().to_rfc3339();

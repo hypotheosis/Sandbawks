@@ -292,9 +292,15 @@ pub enum WaitOutcome {
 /// Shared inner state. Held behind an `Arc` so [`EnvdCache`] clones (one
 /// per request via `AppState`) all share the same map and notifier.
 struct Inner {
-    /// `sandbox_id -> CachedSandbox`. [`DashMap`] mirrors the lock-free
-    /// sharded map already used by [`crate::envd_client::EnvdPool`].
-    map: DashMap<String, CachedSandbox>,
+    /// `sandbox_id -> namespace -> CachedSandbox`. [`DashMap`] mirrors the
+    /// lock-free sharded map already used by [`crate::envd_client::EnvdPool`].
+    ///
+    /// Keyed by name first because a request names its sandbox by id; the
+    /// inner map (almost always one entry — ids are generated) holds every
+    /// namespace with a sandbox of that name, since names are only unique
+    /// within a namespace (issue #13). [`EnvdCache::namespaces_of`] reads it
+    /// for the signature-only `/files` path, which carries no namespace.
+    map: DashMap<String, HashMap<String, CachedSandbox>>,
 
     /// Woken on every map mutation. Waiters re-read the map on each
     /// wake; a single global `Notify` (rather than one per sandbox)
@@ -339,11 +345,27 @@ impl EnvdCache {
         cache
     }
 
-    /// Look up a sandbox's cached projection. Returns `None` when the
-    /// watcher has not (yet) seen the sandbox — the caller disambiguates
-    /// "not synced" from "does not exist" with a single apiserver `get`.
-    pub fn lookup(&self, sandbox_id: &str) -> Option<CachedSandbox> {
-        self.inner.map.get(sandbox_id).map(|entry| entry.clone())
+    /// Look up the cached projection of the sandbox `sandbox_id` in
+    /// `namespace`. Returns `None` when the watcher has not (yet) seen it —
+    /// the caller disambiguates "not synced" from "does not exist" with a
+    /// single apiserver `get`.
+    pub fn lookup(&self, namespace: &str, sandbox_id: &str) -> Option<CachedSandbox> {
+        self.inner
+            .map
+            .get(sandbox_id)
+            .and_then(|by_ns| by_ns.get(namespace).cloned())
+    }
+
+    /// Every namespace the watcher has seen a sandbox named `sandbox_id` in.
+    ///
+    /// Used where a request names a sandbox but carries no namespace (a
+    /// signed `/files` URL): each candidate's credential is checked in turn.
+    pub fn namespaces_of(&self, sandbox_id: &str) -> Vec<String> {
+        self.inner
+            .map
+            .get(sandbox_id)
+            .map(|by_ns| by_ns.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Upsert a sandbox's projection and wake any waiters.
@@ -352,13 +374,14 @@ impl EnvdCache {
     /// `resolve_sandbox` seed path uses [`EnvdCache::seed_if_absent`]
     /// instead, which must not clobber a fresher watcher write.
     pub fn apply(&self, sandbox: &Sandbox) {
-        let id = sandbox.name_any();
-        if id.is_empty() {
+        let Some((namespace, id)) = cache_key(sandbox) else {
             return;
-        }
+        };
         self.inner
             .map
-            .insert(id, CachedSandbox::from_sandbox(sandbox));
+            .entry(id)
+            .or_default()
+            .insert(namespace, CachedSandbox::from_sandbox(sandbox));
         // Wake every parked waiter; each re-reads the map and either
         // resolves or re-parks. Cheap relative to the apiserver round
         // trips this replaces.
@@ -382,19 +405,28 @@ impl EnvdCache {
     /// (nothing for a waiter to act on) or leaves a fresher entry in
     /// place (whose insertion already woke waiters).
     pub fn seed_if_absent(&self, sandbox: &Sandbox) {
-        let id = sandbox.name_any();
-        if id.is_empty() {
+        let Some((namespace, id)) = cache_key(sandbox) else {
             return;
-        }
+        };
         self.inner
             .map
             .entry(id)
+            .or_default()
+            .entry(namespace)
             .or_insert_with(|| CachedSandbox::from_sandbox(sandbox));
     }
 
     /// Drop a sandbox's entry (watcher `Delete` events).
-    pub fn remove(&self, sandbox_id: &str) {
-        self.inner.map.remove(sandbox_id);
+    pub fn remove(&self, namespace: &str, sandbox_id: &str) {
+        // Drop the namespace entry, then the id entry once no namespace is
+        // left. `remove_if` re-checks emptiness under the shard lock, so a
+        // concurrent `apply` for another namespace is never lost.
+        if let Some(mut by_ns) = self.inner.map.get_mut(sandbox_id) {
+            by_ns.remove(namespace);
+        }
+        self.inner
+            .map
+            .remove_if(sandbox_id, |_, by_ns| by_ns.is_empty());
     }
 
     /// Reconcile the cache to exactly the set in `sandboxes`
@@ -410,15 +442,17 @@ impl EnvdCache {
     /// overlap is harmless here — the worst case is one extra cache hit
     /// for a sandbox that's seconds from eviction.
     fn replace_all(&self, sandboxes: Vec<Sandbox>) {
-        let fresh: HashMap<String, CachedSandbox> = sandboxes
-            .iter()
-            .filter_map(|s| {
-                let id = s.name_any();
-                (!id.is_empty()).then(|| (id, CachedSandbox::from_sandbox(s)))
-            })
-            .collect();
-        for (id, cached) in &fresh {
-            self.inner.map.insert(id.clone(), cached.clone());
+        let mut fresh: HashMap<String, HashMap<String, CachedSandbox>> = HashMap::new();
+        for sandbox in &sandboxes {
+            if let Some((namespace, id)) = cache_key(sandbox) {
+                fresh
+                    .entry(id)
+                    .or_default()
+                    .insert(namespace, CachedSandbox::from_sandbox(sandbox));
+            }
+        }
+        for (id, by_ns) in &fresh {
+            self.inner.map.insert(id.clone(), by_ns.clone());
         }
         self.inner.map.retain(|id, _| fresh.contains_key(id));
         self.inner.notify.notify_waiters();
@@ -433,7 +467,12 @@ impl EnvdCache {
     /// [`EnvdCache::apply`] landing between the read and the await cannot
     /// be missed — without that ordering a waiter could sleep the full
     /// deadline despite the address already being present.
-    pub async fn wait_until_ready(&self, sandbox_id: &str, deadline: Instant) -> WaitOutcome {
+    pub async fn wait_until_ready(
+        &self,
+        namespace: &str,
+        sandbox_id: &str,
+        deadline: Instant,
+    ) -> WaitOutcome {
         // Remember the last-observed not-ready detail so a deadline expiry can
         // report *why* the sandbox never became ready, rather than a bare
         // timeout. Seeded so a sandbox that vanishes from the cache mid-wait
@@ -450,7 +489,7 @@ impl EnvdCache {
             // Register on the notifier now, before the map read below.
             notified.as_mut().enable();
 
-            if let Some(cached) = self.lookup(sandbox_id) {
+            if let Some(cached) = self.lookup(namespace, sandbox_id) {
                 match cached.readiness() {
                     Readiness::Ready(addr) => return WaitOutcome::Ready(addr),
                     Readiness::Paused => return WaitOutcome::Paused,
@@ -469,6 +508,14 @@ impl EnvdCache {
             }
         }
     }
+}
+
+/// The `(namespace, name)` a sandbox is cached under, or `None` for an
+/// unnamed object. A sandbox from a namespaced watch always carries its
+/// namespace; one without (a hand-built test fixture) is cached under `""`.
+fn cache_key(sandbox: &Sandbox) -> Option<(String, String)> {
+    let id = sandbox.name_any();
+    (!id.is_empty()).then(|| (sandbox.namespace().unwrap_or_default(), id))
 }
 
 impl Default for EnvdCache {
@@ -510,7 +557,11 @@ async fn run_watcher(cache: EnvdCache, api: Api<Sandbox>) {
             Ok(Event::InitApply(sandbox)) => init_buf.push(sandbox),
             Ok(Event::InitDone) => cache.replace_all(std::mem::take(&mut init_buf)),
             Ok(Event::Apply(sandbox)) => cache.apply(&sandbox),
-            Ok(Event::Delete(sandbox)) => cache.remove(&sandbox.name_any()),
+            Ok(Event::Delete(sandbox)) => {
+                if let Some((namespace, id)) = cache_key(&sandbox) {
+                    cache.remove(&namespace, &id);
+                }
+            }
             Err(err) => {
                 tracing::warn!(
                     error = %err,
@@ -534,6 +585,9 @@ async fn run_watcher(cache: EnvdCache, api: Api<Sandbox>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Namespace every fixture sandbox lives in.
+    const NS: &str = "team-a";
     use sandbawks_types::{ResourceQuantity, ResourceRequests, SandboxSpec, SandboxStatus};
 
     /// Build a `Sandbox` fixture with the given id, desired phase, and
@@ -570,6 +624,7 @@ mod tests {
             restore_from: None,
         };
         let mut sb = Sandbox::new(id, spec);
+        sb.metadata.namespace = Some(NS.into());
         sb.status = addr.map(|a| SandboxStatus {
             envd_address: Some(a.to_owned()),
             ..Default::default()
@@ -580,7 +635,7 @@ mod tests {
     #[test]
     fn lookup_misses_on_empty_cache() {
         let cache = EnvdCache::new();
-        assert_eq!(cache.lookup("sbx-1"), None);
+        assert_eq!(cache.lookup(NS, "sbx-1"), None);
     }
 
     #[test]
@@ -591,7 +646,9 @@ mod tests {
             Some(SandboxPhase::Running),
             Some("10.0.0.1:49983"),
         ));
-        let cached = cache.lookup("sbx-1").expect("entry present after apply");
+        let cached = cache
+            .lookup(NS, "sbx-1")
+            .expect("entry present after apply");
         assert_eq!(cached.desired_phase, Some(SandboxPhase::Running));
         assert_eq!(cached.envd_address.as_deref(), Some("10.0.0.1:49983"));
     }
@@ -600,7 +657,7 @@ mod tests {
     fn seed_if_absent_inserts_when_missing() {
         let cache = EnvdCache::new();
         cache.seed_if_absent(&sandbox("sbx-1", None, None));
-        assert!(cache.lookup("sbx-1").is_some());
+        assert!(cache.lookup(NS, "sbx-1").is_some());
     }
 
     #[test]
@@ -613,7 +670,7 @@ mod tests {
         cache.seed_if_absent(&sandbox("sbx-1", None, None));
         assert_eq!(
             cache
-                .lookup("sbx-1")
+                .lookup(NS, "sbx-1")
                 .and_then(|c| c.envd_address)
                 .as_deref(),
             Some("10.0.0.1:49983")
@@ -624,8 +681,8 @@ mod tests {
     fn remove_drops_entry() {
         let cache = EnvdCache::new();
         cache.apply(&sandbox("sbx-1", None, Some("10.0.0.1:49983")));
-        cache.remove("sbx-1");
-        assert_eq!(cache.lookup("sbx-1"), None);
+        cache.remove(NS, "sbx-1");
+        assert_eq!(cache.lookup(NS, "sbx-1"), None);
     }
 
     #[test]
@@ -634,10 +691,10 @@ mod tests {
         cache.apply(&sandbox("sbx-stale", None, Some("10.0.0.9:1")));
         // Re-list after a reconnect that no longer contains `sbx-stale`.
         cache.replace_all(vec![sandbox("sbx-fresh", None, Some("10.0.0.1:2"))]);
-        assert_eq!(cache.lookup("sbx-stale"), None);
+        assert_eq!(cache.lookup(NS, "sbx-stale"), None);
         assert_eq!(
             cache
-                .lookup("sbx-fresh")
+                .lookup(NS, "sbx-fresh")
                 .and_then(|c| c.envd_address)
                 .as_deref(),
             Some("10.0.0.1:2")
@@ -650,7 +707,7 @@ mod tests {
         cache.apply(&sandbox("sbx-1", None, Some("10.0.0.1:49983")));
         let deadline = Instant::now() + std::time::Duration::from_secs(300);
         assert_eq!(
-            cache.wait_until_ready("sbx-1", deadline).await,
+            cache.wait_until_ready(NS, "sbx-1", deadline).await,
             WaitOutcome::Ready("10.0.0.1:49983".to_owned())
         );
     }
@@ -661,7 +718,7 @@ mod tests {
         cache.apply(&sandbox("sbx-1", Some(SandboxPhase::Paused), None));
         let deadline = Instant::now() + std::time::Duration::from_secs(300);
         assert_eq!(
-            cache.wait_until_ready("sbx-1", deadline).await,
+            cache.wait_until_ready(NS, "sbx-1", deadline).await,
             WaitOutcome::Paused
         );
     }
@@ -674,7 +731,7 @@ mod tests {
         // `start_paused` auto-advances time past the deadline once the
         // runtime is otherwise idle, so this resolves without a real wait.
         assert!(matches!(
-            cache.wait_until_ready("sbx-1", deadline).await,
+            cache.wait_until_ready(NS, "sbx-1", deadline).await,
             WaitOutcome::TimedOut(_)
         ));
     }
@@ -704,7 +761,7 @@ mod tests {
         let cache = EnvdCache::new();
         cache.apply(&sandbox("sbx-1", None, Some("10.0.0.1:49983")));
         assert_eq!(
-            cache.lookup("sbx-1").unwrap().readiness(),
+            cache.lookup(NS, "sbx-1").unwrap().readiness(),
             Readiness::Ready("10.0.0.1:49983".to_owned())
         );
     }
@@ -719,7 +776,7 @@ mod tests {
             Some("10.0.0.1:49983"),
         ));
         assert_eq!(
-            cache.lookup("sbx-1").unwrap().readiness(),
+            cache.lookup(NS, "sbx-1").unwrap().readiness(),
             Readiness::Paused
         );
     }
@@ -736,7 +793,7 @@ mod tests {
                 ..Default::default()
             },
         ));
-        let Readiness::NotReady(nr) = cache.lookup("sbx-1").unwrap().readiness() else {
+        let Readiness::NotReady(nr) = cache.lookup(NS, "sbx-1").unwrap().readiness() else {
             panic!("expected NotReady");
         };
         assert!(
@@ -759,7 +816,7 @@ mod tests {
                 ..Default::default()
             },
         ));
-        let Readiness::NotReady(nr) = cache.lookup("sbx-1").unwrap().readiness() else {
+        let Readiness::NotReady(nr) = cache.lookup(NS, "sbx-1").unwrap().readiness() else {
             panic!("expected NotReady");
         };
         assert!(nr.terminal);
@@ -780,7 +837,7 @@ mod tests {
                 ..Default::default()
             },
         ));
-        let Readiness::NotReady(nr) = cache.lookup("sbx-1").unwrap().readiness() else {
+        let Readiness::NotReady(nr) = cache.lookup(NS, "sbx-1").unwrap().readiness() else {
             panic!("expected NotReady");
         };
         assert!(nr.terminal, "ImagePullBackOff must classify as terminal");
@@ -799,7 +856,7 @@ mod tests {
                 ..Default::default()
             },
         ));
-        let Readiness::NotReady(nr) = cache.lookup("sbx-1").unwrap().readiness() else {
+        let Readiness::NotReady(nr) = cache.lookup(NS, "sbx-1").unwrap().readiness() else {
             panic!("expected NotReady");
         };
         assert!(!nr.terminal, "ContainerCreating is transient, not terminal");
@@ -897,7 +954,7 @@ mod tests {
             },
         ));
         let deadline = Instant::now() + std::time::Duration::from_secs(300);
-        let outcome = cache.wait_until_ready("sbx-1", deadline).await;
+        let outcome = cache.wait_until_ready(NS, "sbx-1", deadline).await;
         let WaitOutcome::Terminal(nr) = outcome else {
             panic!("expected Terminal, got {outcome:?}");
         };
@@ -916,7 +973,7 @@ mod tests {
             },
         ));
         let deadline = Instant::now() + std::time::Duration::from_secs(15);
-        let WaitOutcome::TimedOut(nr) = cache.wait_until_ready("sbx-1", deadline).await else {
+        let WaitOutcome::TimedOut(nr) = cache.wait_until_ready(NS, "sbx-1", deadline).await else {
             panic!("expected TimedOut");
         };
         assert_eq!(nr.sandbox_phase, SandboxPhase::Resuming);
@@ -928,7 +985,8 @@ mod tests {
         cache.apply(&sandbox("sbx-1", None, None));
         let waiter = cache.clone();
         let deadline = Instant::now() + std::time::Duration::from_secs(300);
-        let handle = tokio::spawn(async move { waiter.wait_until_ready("sbx-1", deadline).await });
+        let handle =
+            tokio::spawn(async move { waiter.wait_until_ready(NS, "sbx-1", deadline).await });
 
         // Yield so the waiter parks, then deliver the address.
         tokio::task::yield_now().await;
@@ -938,5 +996,51 @@ mod tests {
             handle.await.expect("waiter task joins"),
             WaitOutcome::Ready("10.0.0.1:49983".to_owned())
         );
+    }
+
+    /// Sandboxes are only unique per namespace (issue #13): two with the same
+    /// name in different namespaces are cached, looked up and removed
+    /// independently.
+    #[test]
+    fn same_name_in_two_namespaces_is_kept_apart() {
+        let cache = EnvdCache::new();
+        let mut other = sandbox("sbx-1", None, Some("10.0.0.2:49983"));
+        other.metadata.namespace = Some("team-b".into());
+        cache.apply(&sandbox("sbx-1", None, Some("10.0.0.1:49983")));
+        cache.apply(&other);
+
+        let mut namespaces = cache.namespaces_of("sbx-1");
+        namespaces.sort();
+        assert_eq!(namespaces, vec!["team-a".to_owned(), "team-b".to_owned()]);
+        assert_eq!(
+            cache.lookup(NS, "sbx-1").unwrap().readiness(),
+            Readiness::Ready("10.0.0.1:49983".into())
+        );
+        assert_eq!(
+            cache.lookup("team-b", "sbx-1").unwrap().readiness(),
+            Readiness::Ready("10.0.0.2:49983".into())
+        );
+        assert_eq!(cache.lookup("team-c", "sbx-1"), None);
+
+        cache.remove(NS, "sbx-1");
+        assert_eq!(cache.lookup(NS, "sbx-1"), None);
+        assert!(cache.lookup("team-b", "sbx-1").is_some());
+        assert_eq!(cache.namespaces_of("sbx-1"), vec!["team-b".to_owned()]);
+
+        cache.remove("team-b", "sbx-1");
+        assert!(cache.namespaces_of("sbx-1").is_empty());
+        assert!(
+            cache.inner.map.is_empty(),
+            "an id with no namespaces left is dropped"
+        );
+    }
+
+    #[test]
+    fn replace_all_keeps_every_namespace_of_a_name() {
+        let cache = EnvdCache::new();
+        let mut other = sandbox("sbx-1", None, None);
+        other.metadata.namespace = Some("team-b".into());
+        cache.replace_all(vec![sandbox("sbx-1", None, None), other]);
+        assert_eq!(cache.namespaces_of("sbx-1").len(), 2);
     }
 }

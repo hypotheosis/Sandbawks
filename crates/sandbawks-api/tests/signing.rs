@@ -18,6 +18,7 @@ fn fresh_payload() -> SignedUrlPayload {
         path: "/home/user/x.txt".into(),
         method: "PUT".into(),
         exp: chrono::Utc::now().timestamp() + 60,
+        namespace: Some("team-acme".into()),
     }
 }
 
@@ -84,4 +85,37 @@ fn rejects_malformed_token() {
         matches!(err, sandbawks_api::AppError::BadRequest { .. }),
         "expected BadRequest, got {err:?}",
     );
+}
+
+/// The namespace a token is minted for survives the round trip (issue #13).
+#[test]
+fn round_trips_namespace() {
+    let token = mint(&key(), &fresh_payload());
+    let decoded = verify(&key(), &token).expect("verify should accept");
+    assert_eq!(decoded.namespace.as_deref(), Some("team-acme"));
+}
+
+/// A token minted before the `namespace` field existed has no namespace in
+/// its body; it still verifies, and decodes as `None` (the handler then uses
+/// the gateway's default namespace).
+#[test]
+fn pre_namespace_token_still_verifies() {
+    let token = mint(
+        &key(),
+        &SignedUrlPayload {
+            namespace: None,
+            ..fresh_payload()
+        },
+    );
+    let body = token.split_once('.').unwrap().0;
+    let json = String::from_utf8(
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, body).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !json.contains("namespace"),
+        "None is omitted from the body: {json}"
+    );
+    let decoded = verify(&key(), &token).expect("verify should accept");
+    assert_eq!(decoded.namespace, None);
 }
