@@ -63,6 +63,7 @@ export default defineConfig({
 					items: [
 						{ label: 'The Sandbawks components', slug: 'explanation/components' },
 						{ label: 'How Sandbawks maps E2B onto Kubernetes', slug: 'explanation/how-sandbawks-maps-e2b-onto-kubernetes' },
+						{ label: 'Multi-namespace tenancy', slug: 'explanation/multi-namespace-tenancy' },
 					],
 				},
 			],
