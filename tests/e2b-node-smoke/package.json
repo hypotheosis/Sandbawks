@@ -1,0 +1,17 @@
+{
+  "name": "sandbawks-e2b-node-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Clean-room E2B JS SDK smoke against a live sandbawks gateway (hostname mode). Reproduces the zidane shell-timeout symptom without zidane.",
+  "type": "module",
+  "scripts": {
+    "smoke": "tsx smoke.ts"
+  },
+  "dependencies": {
+    "@e2b/code-interpreter": "~2.5.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "~5.5.0"
+  }
+}

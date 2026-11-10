@@ -1,0 +1,597 @@
+{{- if .Values.node.enabled }}
+{{- /*
+  hostPathContainerdData is bind-mounted at mountPath == hostPath (issue #389),
+  so it must be a non-empty absolute path. Fail at `helm install` instead of
+  emitting a Pod with an invalid mount kubelet rejects with an opaque error —
+  same fail-fast guard class as extraHostPathMounts[].mountPath below.
+*/ -}}
+{{- if not (hasPrefix "/" (.Values.node.hostPathContainerdData | default "")) }}
+{{- fail "node.hostPathContainerdData must be a non-empty absolute path (e.g. /var/lib/containerd, or /var/lib/rancher/k3s/agent/containerd on k3s); it is bind-mounted at mountPath == hostPath" }}
+{{- end }}
+{{- /* memoryPressure.cgroupRoot is also mounted at mountPath == hostPath; same guard. */ -}}
+{{- if .Values.node.memoryPressure.enabled }}
+{{- if not (hasPrefix "/" (.Values.node.memoryPressure.cgroupRoot | default "")) }}
+{{- fail "node.memoryPressure.cgroupRoot must be a non-empty absolute path (default /sys/fs/cgroup); it is bind-mounted at mountPath == hostPath" }}
+{{- end }}
+{{- end }}
+{{- /* sandboxPressure.cgroupRoot (epic #472) shares the same host cgroup mount. */ -}}
+{{- if .Values.node.sandboxPressure.enabled }}
+{{- if not (hasPrefix "/" (.Values.node.sandboxPressure.cgroupRoot | default "")) }}
+{{- fail "node.sandboxPressure.cgroupRoot must be a non-empty absolute path (default /sys/fs/cgroup); it is bind-mounted at mountPath == hostPath" }}
+{{- end }}
+{{- end }}
+{{- /*
+  The memory-pressure (#307) and sandbox-pressure (#472) watchers read the same
+  read-only host cgroup tree, so they share ONE `cgroup` volume + mount. When
+  both are enabled their roots must agree, or the single mount would be wrong for
+  one of them. Compute the shared need + path once here.
+*/ -}}
+{{- if and .Values.node.memoryPressure.enabled .Values.node.sandboxPressure.enabled }}
+{{- if ne (.Values.node.memoryPressure.cgroupRoot | default "/sys/fs/cgroup") (.Values.node.sandboxPressure.cgroupRoot | default "/sys/fs/cgroup") }}
+{{- fail "node.memoryPressure.cgroupRoot and node.sandboxPressure.cgroupRoot must match when both watchers are enabled (they share one host cgroup mount)" }}
+{{- end }}
+{{- end }}
+{{- /*
+  #550 Capability C guards. runscAutoReconcile (#546, restart-free binary swap)
+  and runscAutoUpgrade (#550, restart-bearing host install) are alternative
+  convergence strategies: with both armed the restart-free swap converges the
+  binary first, so the restart-bearing path would never fire — enabling both is a
+  misconfiguration, fail fast. And the privileged upgrade behavior needs its
+  surface (RBAC + host mount), so runscAutoUpgrade requires runscUpgrade.enabled.
+*/ -}}
+{{- if and .Values.node.runscAutoReconcile .Values.node.runscAutoUpgrade }}
+{{- fail "node.runscAutoReconcile (#546 restart-free swap) and node.runscAutoUpgrade (#550 restart-bearing install) are mutually exclusive; enable at most one" }}
+{{- end }}
+{{- if and .Values.node.runscAutoUpgrade (not .Values.node.runscUpgrade.enabled) }}
+{{- fail "node.runscAutoUpgrade requires node.runscUpgrade.enabled=true (the privileged upgrade surface: lease RBAC + host installer mount)" }}
+{{- end }}
+{{- /*
+  The host /usr/local/bin mount is shared: the #546 reconciler reads/swaps the
+  host runsc there, and the #550 upgrader reads the host runsc version there to
+  decide whether to upgrade. Mount it whenever EITHER is enabled.
+*/ -}}
+{{- $runscHostBinNeeded := or .Values.node.runscReconcile.enabled .Values.node.runscUpgrade.enabled }}
+{{- /*
+  node.runscVersion is a YYYYMMDD.N STRING (the gVisor release), not a number, and
+  it is rendered into SANDBAWKS_RUNSC_VERSION with `| quote`. An operator who sets
+  it UNQUOTED in a values file has it parsed to a YAML float, and `| quote` then
+  emits Go's float formatting — e.g. `20260608.0` → "2.0260608e+07" — which never
+  equals a `release-<ver>` token, so the #546/#550 version comparison silently
+  treats every node as drifted. The original string can't be reliably recovered
+  from a coerced float, so fail fast (only when the value is actually consumed).
+*/ -}}
+{{- if and $runscHostBinNeeded (not (kindIs "string" .Values.node.runscVersion)) }}
+{{- fail "node.runscVersion must be a quoted string (e.g. \"20260525.0\") — an unquoted YAML number is coerced to a float and renders as e.g. 2.0260608e+07 in SANDBAWKS_RUNSC_VERSION, breaking the release-<ver> match" }}
+{{- end }}
+{{- $cgroupNeeded := or .Values.node.memoryPressure.enabled .Values.node.sandboxPressure.enabled }}
+{{- $cgroupRoot := ternary (.Values.node.sandboxPressure.cgroupRoot | default "/sys/fs/cgroup") (.Values.node.memoryPressure.cgroupRoot | default "/sys/fs/cgroup") (and .Values.node.sandboxPressure.enabled (not .Values.node.memoryPressure.enabled)) }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sandbawks-node
+  labels: {{- include "sandbawks.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "sandbawks.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: node
+  template:
+    metadata:
+      labels:
+        {{- include "sandbawks.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: node
+    spec:
+      serviceAccountName: sandbawks-node
+      hostPID: true   # required for talking to local CRI socket
+      {{- /*
+        Scheduling knobs (#594). The DaemonSet controller auto-tolerates the
+        stock node-condition taints (not-ready, unreachable, *-pressure,
+        unschedulable) but NOT custom pool taints, so a dedicated runtime pool
+        tainted e.g. `kata=true:NoSchedule` would otherwise exclude this DS —
+        the node then never stages envd nor advertises `sandbawks.dev/envd-staged`,
+        and sandbox Pods pinned there by the RuntimeClass nodeSelector wedge in
+        Pending. `node.tolerations`/`node.nodeSelector` let an operator place the
+        DS onto such a pool without forking the chart. Both default empty, so the
+        rendered Pod is byte-identical to before when unset.
+      */}}
+      {{- with .Values.node.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        # Stage the static envd binary onto the node (issue #265). Every
+        # sandbox Pod mounts `node.hostPathEnvd` read-only and execs the
+        # binary as its entrypoint, so customers never bundle envd in
+        # their template images. envd is delivered this way — rather than
+        # via a per-Pod init container — so the cold-start and restore
+        # Pods stay topologically identical to the `runsc checkpoint`
+        # (no extra container / volume for the shim restore to choke on),
+        # and the binary stays out of the memory image. The staged binary
+        # is the cluster-wide `envd` image; it must be byte-identical
+        # across nodes so a sandbox can resume on any node.
+        - name: stage-envd
+          image: "{{ .Values.envd.image }}:{{ .Values.envd.tag }}"
+          imagePullPolicy: {{ .Values.envd.pullPolicy }}
+          # envd installs itself (issue #268): `self-install` copies
+          # `/proc/self/exe` to the dest with no shell or `cp`, so the
+          # carrier image (`.Values.envd.image`) carries only the static
+          # binary on `scratch` — no `python:3.12-slim` userland.
+          command: ["/usr/local/bin/envd", "self-install", "/sandbawks/envd/envd"]
+          securityContext:
+            # The DirectoryOrCreate hostPath is root-owned, so the writer
+            # must be root. The `scratch` carrier (issue #268) sets no
+            # USER and so already defaults to uid 0; this is the explicit,
+            # image-independent guarantee that it stays that way.
+            runAsUser: 0
+            runAsGroup: 0
+          volumeMounts:
+            - name: envd-bin
+              mountPath: /sandbawks/envd
+      containers:
+        - name: node
+          image: "{{ .Values.images.node.repository }}:{{ .Values.images.node.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.images.node.pullPolicy }}
+          args: []
+          env:
+            # Downward-API: the pod's host node name. The node reconciler
+            # filters SnapshotJob CRs by `.spec.nodeName == $NODE_NAME` so
+            # each DaemonSet replica only handles work on its own node.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Downward-API: the namespace this DaemonSet runs in, which is
+            # where the controller creates SnapshotJob CRs. Without it the
+            # node reconciler watches the wrong namespace, leaving every
+            # pause SnapshotJob unclaimed and warm-pool members stuck in
+            # `Pausing`. Mirrors the controller deployment's injection.
+            - name: SANDBAWKS_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Snapshot backend selector + Azure Blob wiring (issue #585).
+            # The S3_* vars above stay set under either provider (harmless
+            # when unused); the Azure vars below are empty under the S3
+            # default. SANDBAWKS_AZURE_ACCOUNT_KEY arrives via the `envFrom`
+            # snapshot-store Secret, not as a plaintext value here.
+            - name: SANDBAWKS_SNAPSHOT_PROVIDER
+              value: {{ .Values.snapshotStore.provider | quote }}
+            - name: SANDBAWKS_AZURE_ACCOUNT_NAME
+              value: {{ .Values.snapshotStore.azure.accountName | quote }}
+            - name: SANDBAWKS_AZURE_CONTAINER
+              value: {{ .Values.snapshotStore.azure.container | quote }}
+            - name: SANDBAWKS_AZURE_ENDPOINT
+              value: {{ .Values.snapshotStore.azure.endpoint | quote }}
+            - name: SANDBAWKS_S3_ENDPOINT
+              value: {{ .Values.snapshotStore.endpoint | quote }}
+            - name: SANDBAWKS_S3_BUCKET
+              value: {{ .Values.snapshotStore.bucket | quote }}
+            - name: SANDBAWKS_S3_REGION
+              value: {{ .Values.snapshotStore.region | quote }}
+            {{- if .Values.node.s3Parallelism }}
+            # In-flight chunk concurrency for snapshot upload/download. Omitted
+            # by default (binary uses 8); the snapshot path is per-request
+            # latency-bound against garage, so raising this scales throughput
+            # until the backend saturates. Raises peak node RSS (~(2N+1)·4 MiB),
+            # so keep it well under the pod memory limit.
+            - name: SANDBAWKS_S3_PARALLELISM
+              value: {{ .Values.node.s3Parallelism | quote }}
+            {{- end }}
+            {{- if .Values.node.s3ChunkMib }}
+            # Per-chunk object size (MiB) for snapshot transfer. Omitted by
+            # default (binary uses 4). Each chunk is one S3 object, so larger
+            # chunks cut the PUT/GET request count; useful when the backend's
+            # per-object overhead dominates. Raises peak RSS (~(2N+1)·chunk) —
+            # mind the interaction with `s3Parallelism` under the memory limit.
+            - name: SANDBAWKS_S3_CHUNK_MIB
+              value: {{ .Values.node.s3ChunkMib | quote }}
+            {{- end }}
+            {{- if .Values.node.snapshotValidateLevel }}
+            # Pause restorability validate level (#235): off | head | sha | full.
+            # Unset → the binary default `head` (confirm each object exists + is
+            # the right size, no body download/decompress). Raise to sha/full
+            # for stronger fail-closed guarantees at higher pause latency.
+            - name: SANDBAWKS_S3_VALIDATE_LEVEL
+              value: {{ .Values.node.snapshotValidateLevel | quote }}
+            {{- end }}
+            {{- /*
+              Sandbox runtime profile for this node pool (#594). `node.runtime`
+              is the single knob: it selects BOTH the pause/resume adapter
+              (`SANDBAWKS_RUNTIME_ADAPTER`) and the default CRI handler the
+              `envd-staged` gate matches (`SANDBAWKS_GVISOR_RUNTIME_HANDLER`,
+              #417), so a Kata pool needs only `node.runtime: kata` — not two
+              must-match values. The adapter and handler are still distinct binary
+              flags because the handler is the *exact* registered CRI string,
+              which is operator-renameable and has variants (`kata` vs `kata-cc`);
+              `node.runtimeHandler` overrides just the handler for those cases.
+              Default handler per runtime: gvisor→(binary default `runsc`),
+              kata→`kata`. Unset `node.runtime` ⇒ pure gVisor default, env-free.
+            */}}
+            {{- $handler := .Values.node.runtimeHandler }}
+            {{- if and (not $handler) (or (eq .Values.node.runtime "kata") (eq .Values.node.runtime "kata-fc")) }}
+            {{-   $handler = "kata" }}
+            {{- end }}
+            {{- if $handler }}
+            - name: SANDBAWKS_GVISOR_RUNTIME_HANDLER
+              value: {{ $handler | quote }}
+            {{- end }}
+            {{- if .Values.node.runtime }}
+            - name: SANDBAWKS_RUNTIME_ADAPTER
+              value: {{ .Values.node.runtime | quote }}
+            {{- end }}
+            # In-container runsc `--root` (issue #343). On stock containerd the
+            # binary default is correct; k3s/RKE2 place the shim's runsc state
+            # under a different subtree, so the chart surfaces this explicitly
+            # to keep the override one `node.runscRoot` value away. Without it
+            # every pause fails with "FetchSpec failed: loading container: file
+            # does not exist".
+            - name: SANDBAWKS_RUNSC_ROOT
+              value: {{ .Values.node.runscRoot | quote }}
+            {{- with .Values.node.runscRootFallbacks }}
+            # Per-environment fallback runsc `--root` candidates (issue #366),
+            # probed in order after SANDBAWKS_RUNSC_ROOT until one is found to
+            # hold the target container. The binary bakes in no distro layout;
+            # list the in-container path(s) where *this* cluster's gVisor shim
+            # keeps runsc state and expose them via `node.extraHostPathMounts`.
+            # Colon-joined to match the binary's list parser.
+            - name: SANDBAWKS_RUNSC_ROOT_FALLBACKS
+              value: {{ join ":" . | quote }}
+            {{- end }}
+            {{- with .Values.node.runscRootSearchDirs }}
+            # Containerd run/state root(s) the node searches to DISCOVER the
+            # runsc state root when no explicit candidate matches (issue #377) —
+            # the preferred, distro-agnostic mechanism. Point these at this
+            # cluster's mounted containerd run/state root(s) (via the
+            # `containerd-run` mount or `node.extraHostPathMounts`) and the node
+            # finds the `<root>/<container-id>` state dir wherever the shim put
+            # it. Colon-joined to match the binary's list parser.
+            - name: SANDBAWKS_RUNSC_ROOT_SEARCH_DIRS
+              value: {{ join ":" . | quote }}
+            {{- end }}
+            # Restore staging root (issue #512): where the node stages restore
+            # bundles, sweeps orphans, and confines every staged target. Fed by
+            # the `sandbawks.stagingRoot` helper — the SAME value as the
+            # `staging-cache` mountPath/hostPath above and the controller's
+            # `SANDBAWKS_RESTORE_STAGING_ROOT` — so the three never diverge.
+            - name: SANDBAWKS_STAGING_ROOT
+              value: {{ include "sandbawks.stagingRoot" . | quote }}
+            # Fail-closed resource-headroom guard (issue #238). The node
+            # refuses to stage/restore a snapshot that would exhaust node
+            # disk or memory under these tunables.
+            - name: SANDBAWKS_HEADROOM_FRACTION
+              value: {{ .Values.node.headroomFraction | quote }}
+            # `int64` first: Helm parses YAML numbers as float64, so a
+            # bare `| quote` renders 1073741824 as "1.073741824e+09",
+            # which the binary's u64 flag parser rejects. int64 forces a
+            # plain integer string. (Holds for `--set` overrides too.)
+            - name: SANDBAWKS_HEADROOM_MIN_FREE_BYTES
+              value: {{ .Values.node.headroomMinFreeBytes | int64 | quote }}
+            {{- if .Values.node.memoryPressure.enabled }}
+            # Host-side memory-pressure reaction (#307): watch each sandbox pod
+            # cgroup and capture its envd /__state to S3 before the OOM kill.
+            - name: SANDBAWKS_MEMORY_PRESSURE_ENABLED
+              value: "true"
+            - name: SANDBAWKS_MEMORY_PRESSURE_CGROUP_ROOT
+              value: {{ .Values.node.memoryPressure.cgroupRoot | default "/sys/fs/cgroup" | quote }}
+            - name: SANDBAWKS_MEMORY_PRESSURE_HIGH_WATER_FRACTION
+              value: {{ .Values.node.memoryPressure.highWaterFraction | quote }}
+            # int64 forces a plain integer string (see headroom note above).
+            - name: SANDBAWKS_MEMORY_PRESSURE_INTERVAL_SECS
+              value: {{ .Values.node.memoryPressure.intervalSeconds | int64 | quote }}
+            {{- end }}
+            {{- if .Values.node.sandboxPressure.enabled }}
+            # Per-sandbox resource-pressure telemetry (epic #472): threshold
+            # warn/info logs + continuous OTel gauges (cpu/mem/disk/io/net).
+            - name: SANDBAWKS_SANDBOX_PRESSURE_ENABLED
+              value: "true"
+            - name: SANDBAWKS_SANDBOX_PRESSURE_CGROUP_ROOT
+              value: {{ .Values.node.sandboxPressure.cgroupRoot | default "/sys/fs/cgroup" | quote }}
+            - name: SANDBAWKS_SANDBOX_PRESSURE_PROC_ROOT
+              value: {{ .Values.node.sandboxPressure.procRoot | default "/proc" | quote }}
+            # int64 forces plain integer strings (see headroom note above).
+            - name: SANDBAWKS_SANDBOX_PRESSURE_CHECK_INTERVAL_MS
+              value: {{ .Values.node.sandboxPressure.checkIntervalMs | int64 | quote }}
+            - name: SANDBAWKS_SANDBOX_PRESSURE_REPORT_INTERVAL_MS
+              value: {{ .Values.node.sandboxPressure.reportIntervalMs | int64 | quote }}
+            - name: SANDBAWKS_SANDBOX_PRESSURE_WALK_INTERVAL_SECS
+              value: {{ .Values.node.sandboxPressure.walkIntervalSeconds | int64 | quote }}
+            - name: SANDBAWKS_SANDBOX_PRESSURE_CPU_WARN_FRACTION
+              value: {{ .Values.node.sandboxPressure.cpuWarnFraction | quote }}
+            - name: SANDBAWKS_SANDBOX_PRESSURE_MEM_WARN_FRACTION
+              value: {{ .Values.node.sandboxPressure.memWarnFraction | quote }}
+            - name: SANDBAWKS_SANDBOX_PRESSURE_DISK_WARN_FRACTION
+              value: {{ .Values.node.sandboxPressure.diskWarnFraction | quote }}
+            - name: SANDBAWKS_SANDBOX_PRESSURE_PSI_WARN_PERCENT
+              value: {{ .Values.node.sandboxPressure.psiWarnPercent | quote }}
+            - name: SANDBAWKS_SANDBOX_PRESSURE_CLEAR_RATIO
+              value: {{ .Values.node.sandboxPressure.clearRatio | quote }}
+            {{- end }}
+            # #546 master toggle, emitted for BOTH states so the binary parks its
+            # reconciler task when disabled (rather than waking every interval to
+            # no-op) instead of inferring "off" from absent env.
+            - name: SANDBAWKS_RUNSC_RECONCILE_ENABLED
+              value: {{ .Values.node.runscReconcile.enabled | quote }}
+            {{- if .Values.node.runscReconcile.enabled }}
+            # Restart-free host runsc version reporting + legacy-apt-channel
+            # cleanup + opt-in binary convergence (#546, sub-issue of #545). The
+            # node shells the HOST runsc (mounted read-write at /host/usr/local/bin)
+            # for `--version`, stamps it on the Node + an info gauge, and removes
+            # the rolling gVisor apt source so a host `apt-get upgrade` can't bump
+            # runsc off its pin (#455). With runscAutoReconcile=true a DRAINED node
+            # at a mismatched version has /usr/local/bin/runsc + shim atomically
+            # swapped for the image-bundled pinned build — no k3s restart, no nsenter.
+            - name: SANDBAWKS_RUNSC_VERSION
+              value: {{ .Values.node.runscVersion | quote }}
+            - name: SANDBAWKS_RUNSC_AUTO_RECONCILE
+              value: {{ .Values.node.runscAutoReconcile | quote }}
+            # int64 forces a plain integer string (see headroom note above).
+            - name: SANDBAWKS_RUNSC_RECONCILE_SECS
+              value: {{ .Values.node.runscReconcile.intervalSeconds | int64 | quote }}
+            # Fixed IN-CONTAINER mount points (the host dirs are configurable via
+            # node.runscReconcile.* and mounted here); set explicitly so a future
+            # binary-default change can't silently desync them from the volumes.
+            - name: SANDBAWKS_RUNSC_HOST_BIN_DIR
+              value: /host/usr/local/bin
+            - name: SANDBAWKS_RUNSC_APT_SOURCE
+              value: /host/etc/apt/sources.list.d/gvisor.list
+            {{- with .Values.node.runscReconcile.aptKeyringPath }}
+            # Optional: also remove the host gVisor apt keyring. Empty by default
+            # (source removal alone disarms the channel); set this AND mount the
+            # containing host dir via node.extraHostPathMounts to enable it.
+            - name: SANDBAWKS_RUNSC_APT_KEYRING
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- /*
+              The upgrader (#550) reads the pinned version + the host runsc path
+              to decide whether to upgrade. When the #546 reconciler is disabled,
+              its block above didn't emit them, so emit them here (guarded by
+              `not runscReconcile.enabled` to avoid a duplicate env key when both
+              are on).
+            */ -}}
+            {{- if and .Values.node.runscUpgrade.enabled (not .Values.node.runscReconcile.enabled) }}
+            - name: SANDBAWKS_RUNSC_VERSION
+              value: {{ .Values.node.runscVersion | quote }}
+            - name: SANDBAWKS_RUNSC_HOST_BIN_DIR
+              value: /host/usr/local/bin
+            {{- end }}
+            # #550 master toggle for the privileged restart-bearing upgrader,
+            # emitted for BOTH states so the binary parks the task when off rather
+            # than inferring off from absent env.
+            - name: SANDBAWKS_RUNSC_UPGRADE_ENABLED
+              value: {{ .Values.node.runscUpgrade.enabled | quote }}
+            {{- if .Values.node.runscUpgrade.enabled }}
+            # Privileged, restart-bearing in-place runsc fleet upgrade (#550,
+            # Capability C of #545). A DRAINED node holding the cluster-wide
+            # one-at-a-time upgrade Lease runs the FULL host installer (CRI handler
+            # rewrite + k3s restart) via `nsenter` into PID 1 + `systemd-run`,
+            # detached so it survives the Pod the restart kills. Acts only with
+            # runscAutoUpgrade=true; off, the loop reports + releases a stale lease.
+            - name: SANDBAWKS_RUNSC_AUTO_UPGRADE
+              value: {{ .Values.node.runscAutoUpgrade | quote }}
+            - name: SANDBAWKS_RUNSC_UPGRADE_LEASE_NAME
+              value: {{ .Values.node.runscUpgrade.leaseName | quote }}
+            # int64 forces a plain integer string (see headroom note above).
+            - name: SANDBAWKS_RUNSC_UPGRADE_LEASE_DURATION_SECS
+              value: {{ .Values.node.runscUpgrade.leaseDurationSeconds | int64 | quote }}
+            - name: SANDBAWKS_RUNSC_UPGRADE_SECS
+              value: {{ .Values.node.runscUpgrade.intervalSeconds | int64 | quote }}
+            # Fixed IN-CONTAINER paths for the nsenter/systemd-run host install,
+            # set explicitly so a future binary-default change can't desync them
+            # from the bundled image binaries + the host staging mount below.
+            - name: SANDBAWKS_RUNSC_UPGRADE_NSENTER
+              value: /usr/local/bin/nsenter
+            - name: SANDBAWKS_RUNSC_UPGRADE_BUNDLED_INSTALLER
+              value: /usr/local/bin/install-runsc-k3s.sh
+            - name: SANDBAWKS_RUNSC_UPGRADE_STAGING_DIR
+              value: /host/opt/sandbawks
+            # Host-namespace path the staged script resolves to — what systemd-run
+            # executes. MUST be hostStagingDir + the bundled script's basename.
+            - name: SANDBAWKS_RUNSC_UPGRADE_HOST_EXEC
+              value: {{ printf "%s/install-runsc-k3s.sh" .Values.node.runscUpgrade.hostStagingDir | quote }}
+            {{- end }}
+            {{- include "sandbawks.observabilityEnv" . | nindent 12 }}
+          envFrom:
+            # SANDBAWKS_S3_ACCESS_KEY + SANDBAWKS_S3_SECRET_KEY land here.
+            - secretRef:
+                name: {{ include "sandbawks.snapshotStoreSecretName" . }}
+          securityContext:
+            privileged: true   # CRI checkpoint API requires this
+            # Override the image's default nonroot user (UID 65532): the
+            # containerd UDS at /run/containerd/containerd.sock is
+            # 0660 root:root on every supported kubelet, and `privileged`
+            # adds capabilities without changing UID — so without this
+            # the node binary gets EPERM on connect. The hostPath
+            # snapshot cache directory is also created as root by
+            # `DirectoryOrCreate`, which requires the writer to be root.
+            runAsUser: 0
+            runAsGroup: 0
+          volumeMounts:
+            # `/run/containerd` covers two needs in one mount:
+            #   - `containerd.sock` for `Containers.Get` /
+            #     `Snapshotter.Mounts` gRPC calls.
+            #   - the runsc state root (`SANDBAWKS_RUNSC_ROOT`, default
+            #     `runsc/k8s.io/<container-id>/`) for `runsc checkpoint` /
+            #     `runsc restore --root`; without this runsc defaults to
+            #     `/var/run/runsc` and errors with "loading container: file
+            #     does not exist". On k3s/RKE2 the shim state lives under a
+            #     different subtree — repoint via `node.runscRoot` (#343).
+            - name: containerd-run
+              mountPath: /run/containerd
+            # `GvisorAdapter::{rootfs_delta,apply_rootfs_delta}` reads /
+            # writes the overlayfs upperdir reported by `Snapshotter.Mounts`
+            # at the *host* path `<containerd-data-root>/io.containerd
+            # .snapshotter.v1.overlayfs/snapshots/<id>/fs`. containerd runs
+            # on the host, so that path is host-absolute — we mount the data
+            # root at the SAME in-container path (`mountPath == hostPath`) so
+            # the reported path resolves verbatim on any distro, with no
+            # path translation in the binary (issue #389; the same trick the
+            # `staging-cache` / `envd-bin` mounts below use). Stock containerd
+            # is `/var/lib/containerd`; k3s/RKE2 relocate the data root and
+            # this mount tracks `node.hostPathContainerdData` automatically.
+            # RW because resume extracts a tar into a fresh upperdir.
+            - name: containerd-data
+              mountPath: {{ .Values.node.hostPathContainerdData }}
+            - name: snapshot-cache
+              mountPath: /var/lib/sandbawks/snapshots
+            # `GvisorAdapter::stage_snapshot` (Plan 07 T8) materializes a
+            # paused sandbox's snapshot bundle here before the shim
+            # restores from it. Unlike `snapshot-cache` (the pause/resume
+            # work-dir), this is the *source* dir the host-side
+            # containerd-shim reads via the restore Pod's
+            # `io.sandbawks/restore-image-path` annotation — so it MUST be
+            # a hostPath, or the shim sees an empty path on the node and
+            # `runsc restore` fails. mountPath == hostPath so the recorded
+            # path resolves identically from the node worker and the shim.
+            # Relocatable via `node.hostPathStagingCache` (issue #512): the
+            # `sandbawks.stagingRoot` helper feeds this mountPath, the hostPath
+            # below, and the node binary's `SANDBAWKS_STAGING_ROOT` env.
+            - name: staging-cache
+              mountPath: {{ include "sandbawks.stagingRoot" . }}
+            # Issue #270: the worker reads the node-staged envd binary to
+            # record its sha256 in the snapshot manifest at pause time and
+            # to verify it is byte-identical at restore time (a drifted
+            # binary corrupts a memory restore). Read-only — the worker
+            # never writes it; only the `stage-envd` init container does.
+            # mountPath == hostPath so `DEFAULT_ENVD_BIN_PATH`
+            # (/var/lib/sandbawks/envd/envd) resolves in the worker.
+            - name: envd-bin
+              mountPath: /var/lib/sandbawks/envd
+              readOnly: true
+            {{- if $runscHostBinNeeded }}
+            # host /usr/local/bin, mounted RW at /host/usr/local/bin (a /host
+            # prefix so it never shadows the node image's own /usr/local/bin, which
+            # holds sandbawks-node + the *bundled* runsc). The #546 reconciler reads
+            # the host runsc version here and, on convergence, atomically replaces
+            # the host runsc + shim; the #550 upgrader reads the version here to
+            # decide whether to run the restart-bearing install. RW so #546 can write.
+            - name: host-usr-local-bin
+              mountPath: /host/usr/local/bin
+            {{- end }}
+            {{- if .Values.node.runscReconcile.enabled }}
+            # #546: host gVisor apt source dir, mounted RW so the node can delete
+            # gvisor.list — disarming the rolling channel that drifts runsc off
+            # its pin (#455). mountPath is fixed; the host source is configurable.
+            - name: host-apt-sources
+              mountPath: /host/etc/apt/sources.list.d
+            {{- end }}
+            {{- if .Values.node.runscUpgrade.enabled }}
+            # #550: host installer-staging dir, mounted RW at the fixed
+            # /host/opt/sandbawks. The node copies the bundled install-runsc-k3s.sh
+            # here (onto the host filesystem) so the detached nsenter+systemd-run
+            # install can execute it from the host. RW so the node can write it.
+            - name: host-installer-staging
+              mountPath: /host/opt/sandbawks
+            {{- end }}
+            {{- if $cgroupNeeded }}
+            # Shared read-only host cgroup-v2 tree for the memory-pressure (#307)
+            # and sandbox-pressure (#472) watchers: the node reads each sandbox
+            # pod cgroup's memory/cpu/io/PSI files. mountPath == hostPath so
+            # kubepods.slice/... paths resolve verbatim.
+            - name: cgroup
+              mountPath: {{ $cgroupRoot }}
+              readOnly: true
+            {{- end }}
+            {{- range .Values.node.extraHostPathMounts }}
+            # Issue #366: operator-defined host mounts so the node can see the
+            # runsc state dir(s) its gVisor shim uses on this cluster, when that
+            # subtree differs from the containerd-run mount above (k3s/RKE2).
+            # The `mountPath` here must match an entry in
+            # `node.runscRootFallbacks`. RW by default because resume's
+            # `runsc restore` writes back into the runsc root. `name` and
+            # `mountPath` are `required` so a typo/omission fails at
+            # `helm install` rather than producing a Pod with a volume mounted
+            # at "" (which kubelet rejects with an opaque error) — #366 review.
+            - name: {{ required "node.extraHostPathMounts[].name is required" .name }}
+              mountPath: {{ required "node.extraHostPathMounts[].mountPath is required" .mountPath }}
+              readOnly: {{ .readOnly | default false }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.node.resources | nindent 12 }}
+      volumes:
+        - name: containerd-run
+          hostPath:
+            # Stock containerd: /run/containerd. k3s/RKE2 relocate this —
+            # override via node.hostPathContainerdRun (see values.yaml).
+            path: {{ .Values.node.hostPathContainerdRun }}
+            type: Directory
+        - name: containerd-data
+          hostPath:
+            # Stock containerd: /var/lib/containerd. k3s/RKE2 relocate the
+            # data root — override via node.hostPathContainerdData. The
+            # volumeMount above mounts this at the same in-container path, so
+            # the snapshotter-reported upperdir resolves verbatim (issue #389).
+            path: {{ .Values.node.hostPathContainerdData }}
+            type: Directory
+        - name: snapshot-cache
+          hostPath:
+            path: {{ .Values.node.hostPathSnapshotCache }}
+            type: DirectoryOrCreate
+        - name: staging-cache
+          hostPath:
+            # Via the `sandbawks.stagingRoot` helper so the hostPath, the
+            # mountPath above, and `SANDBAWKS_STAGING_ROOT` stay equal (#512).
+            path: {{ include "sandbawks.stagingRoot" . }}
+            type: DirectoryOrCreate
+        # Issue #265: the `stage-envd` init container writes the static
+        # envd binary here; sandbox Pods mount the same host dir read-only
+        # and exec `<dir>/envd`. Must match the controller's
+        # `ENVD_STAGE_HOSTPATH` (crates/sandbawks-controller/src/pod_adapter.rs).
+        # Issue #272: once this binary is staged, the `node` container
+        # labels its Node `sandbawks.dev/envd-staged` (init containers run
+        # to completion before it starts), and the controller stamps a
+        # matching nodeAffinity onto sandbox Pods so they never schedule
+        # onto a node before staging finishes.
+        - name: envd-bin
+          hostPath:
+            path: {{ .Values.node.hostPathEnvd }}
+            type: DirectoryOrCreate
+        {{- if $cgroupNeeded }}
+        - name: cgroup
+          hostPath:
+            path: {{ $cgroupRoot }}
+            type: Directory
+        {{- end }}
+        {{- if $runscHostBinNeeded }}
+        # Backing hostPath for the shared host /usr/local/bin mount (#546 swap +
+        # #550 version read).
+        - name: host-usr-local-bin
+          hostPath:
+            # Host /usr/local/bin (where the installer drops the pinned runsc).
+            # `Directory` — it always exists on a provisioned node; a missing one
+            # signals a malformed host rather than something to silently create.
+            path: {{ .Values.node.runscReconcile.hostBinDir }}
+            type: Directory
+        {{- end }}
+        {{- if .Values.node.runscReconcile.enabled }}
+        - name: host-apt-sources
+          hostPath:
+            # Host gVisor apt source dir. `DirectoryOrCreate` so a non-apt or
+            # never-had-gVisor host still admits the Pod (the disarm is then a
+            # no-op — there is no gvisor.list to remove).
+            path: {{ .Values.node.runscReconcile.aptSourceDir }}
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- if .Values.node.runscUpgrade.enabled }}
+        # #550: backing hostPath for the installer-staging mount. `DirectoryOrCreate`
+        # so the node can land the bundled installer here on a host that has no
+        # /opt/sandbawks yet.
+        - name: host-installer-staging
+          hostPath:
+            path: {{ .Values.node.runscUpgrade.hostStagingDir }}
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- range .Values.node.extraHostPathMounts }}
+        # Issue #366: backing hostPath for each operator-defined runsc-state
+        # mount. `DirectoryOrCreate` so a node that has not yet started a gVisor
+        # container (the dir is created lazily by the shim) still admits the Pod.
+        - name: {{ required "node.extraHostPathMounts[].name is required" .name }}
+          hostPath:
+            path: {{ required "node.extraHostPathMounts[].hostPath is required" .hostPath }}
+            type: {{ .type | default "DirectoryOrCreate" }}
+        {{- end }}
+{{- end }}

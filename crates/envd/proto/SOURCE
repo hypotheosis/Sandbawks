@@ -1,0 +1,41 @@
+# Vendored proto provenance.
+#
+# Anything under crates/envd/proto/ that defines RPC wire format MUST be
+# byte-identical to the upstream source pinned here. To re-sync, refresh
+# the commit hash below and recopy the listed files — do not edit the
+# vendored .proto files in place, since divergence from the published
+# E2B spec breaks the SDKs we are trying to stay compatible with.
+
+upstream-repo:   https://github.com/e2b-dev/infra
+upstream-commit: eceb7419f9d06de2923bae4c4ff7ca694dd9e81d
+upstream-license: Apache-2.0
+fetched-on:      2026-05-23
+
+# file mappings: <vendored path>  <-  <upstream path>
+filesystem/filesystem.proto  <-  packages/envd/spec/filesystem/filesystem.proto
+process/process.proto        <-  packages/envd/spec/process/process.proto
+
+# Local modifications (called out per Apache-2.0 §4(b)):
+#
+# filesystem/filesystem.proto adds two sandbawks-private RPCs that do
+# not exist upstream:
+#
+#   rpc WriteAll(WriteAllRequest) returns (WriteAllResponse);
+#   rpc ReadAll(ReadAllRequest)   returns (ReadAllResponse);
+#
+# These back the HMAC-signed file upload/download endpoints in
+# sandbawks-api (Plan 04 T11). They are additive — the upstream RPCs
+# and their field tags are unchanged, so the published E2B SDKs
+# continue to interoperate with the metadata surface. Upstream E2B
+# carries file *content* over HTTP, not gRPC, so the new RPCs cannot
+# conflict with any field tag the SDKs depend on.
+#
+# When re-syncing the upstream commit above, preserve these two RPCs +
+# their message types rather than overwriting them.
+
+# PTY note: upstream does not ship a separate pty.proto. The PTY message
+# is defined inside packages/envd/spec/process/process.proto (package
+# `process`). envd::proto::pty re-exports those types in src/proto.rs
+# rather than duplicating the definitions in a pty.proto, since a second
+# definition would diverge silently the next time upstream changes the
+# PTY message shape.

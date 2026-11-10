@@ -1,0 +1,43 @@
+---
+# Smoke-test fixture for the kind-based deployment test (issue #72 / epic #66).
+#
+# Applied by scripts/smoke-assert.sh against the cluster brought up by
+# `just cluster-up`. The controller (Plan 02) is wired with the *fake*
+# adapter, so this fixture intentionally does NOT exercise real gVisor,
+# pod, or envd workflows — only the `Creating` -> `Running` status
+# transition is asserted here. `image` is required by the schema but
+# unused at this stage; `envdImage` is now optional (issue #273) and
+# omitted here since node-staged envd makes it a no-op.
+apiVersion: sandbawks.dev/v1alpha1
+kind: SandboxTemplate
+metadata:
+  name: smoke-template
+  namespace: default
+spec:
+  image: docker.io/library/busybox:1.36
+  defaultRuntimeClass: gvisor
+  defaultResources:
+    cpu: "100m"
+    memory: "64Mi"
+    ephemeralStorage: "256Mi"
+  defaultTimeoutSeconds: 60
+---
+apiVersion: sandbawks.dev/v1alpha1
+kind: Sandbox
+metadata:
+  name: sbx-smoke
+  namespace: default
+  annotations:
+    # The Plan-02 controller advances `Creating` -> `Running` on the
+    # `PodReady` trigger, which it derives from this annotation (a real
+    # pod watcher lands in Plan 03). Setting it at apply-time lets the
+    # smoke test assert the happy path without standing up a pod.
+    sandbawks.dev/pod-ready: "true"
+spec:
+  templateRef: smoke-template
+  timeoutSeconds: 60
+  autoPause: false
+  resources:
+    cpu: "100m"
+    memory: "64Mi"
+    ephemeralStorage: "256Mi"

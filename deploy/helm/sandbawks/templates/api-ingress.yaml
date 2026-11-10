@@ -1,0 +1,49 @@
+{{- if and .Values.api.enabled .Values.api.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sandbawks-api
+  labels: {{- include "sandbawks.labels" . | nindent 4 }}
+  {{- with .Values.api.ingress.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.api.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.api.ingress.tls }}
+  tls: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.api.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: sandbawks-api
+                port:
+                  number: {{ $.Values.api.service.port }}
+          {{- end }}
+    {{- end }}
+    {{- with .Values.api.sandboxDomain }}
+    # Wildcard host for E2B hostname-based sandbox selection (issue #364):
+    # routes every `{port}-{sandbox_id}.{domain}` URL to the api Service, which
+    # demuxes the target sandbox from the Host. Derived from `api.sandboxDomain`
+    # (which also sets SANDBAWKS_SANDBOX_DOMAIN) so the gateway's parse domain
+    # and the Ingress routing rule cannot drift out of sync.
+    - host: {{ printf "*.%s" . | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: sandbawks-api
+                port:
+                  number: {{ $.Values.api.service.port }}
+    {{- end }}
+{{- end }}

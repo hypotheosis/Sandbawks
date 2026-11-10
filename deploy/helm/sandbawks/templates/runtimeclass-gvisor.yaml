@@ -1,0 +1,24 @@
+{{- /*
+Cluster-scoped RuntimeClass advertising the gVisor `runsc` handler. The
+controller's PodAdapter (Plan 05) stamps `runtimeClassName: gvisor` onto
+sandbox Pods so the kubelet routes them to runsc instead of runc; without
+this resource the Pod stays Pending with `RuntimeClassNotFound`.
+
+NOTE (#417): this resource alone does NOT install the runtime — it only
+declares which handler the scheduler should request. `runsc` +
+`containerd-shim-runsc-v1` must be pre-provisioned and registered in
+containerd on every node that may host a sandbox (see
+`ci/kind-node/Dockerfile`). The `sandbawks-node` DaemonSet gates the
+`envd-staged` scheduling label on each node's kubelet-reported
+`status.runtimeHandlers` actually containing this handler, so a
+misconfigured node is excluded rather than looping sandbox Pods on
+`no runtime for "runsc" is configured`.
+*/ -}}
+{{- if .Values.gvisor.enabled }}
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+  labels: {{- include "sandbawks.labels" . | nindent 4 }}
+handler: runsc
+{{- end }}

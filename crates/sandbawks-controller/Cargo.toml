@@ -1,0 +1,65 @@
+[package]
+name = "sandbawks-controller"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reconcile loop and Sandbox state machine for the sandbawks Kubernetes sandbox controller."
+
+[dependencies]
+sandbawks-types = { path = "../sandbawks-types" }
+sandbawks-observability = { path = "../sandbawks-observability" }
+# OTel metrics API: `reconcile_metrics` records reconcile duration/outcome off
+# the global meter `init_telemetry` registers (the API only, not the SDK).
+opentelemetry = { workspace = true }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }
+# `rust-s3` powers `S3RetentionStore` — the controller's snapshot GC
+# reconciler (issue #186) reuses the same client crate the node
+# DaemonSet's `S3SnapshotSink` is built on, so the controller can LIST
+# + DELETE objects under the configured bucket prefix without standing
+# up a new abstraction stack. Default features off (no native-tls);
+# `tokio-rustls-tls` matches the workspace policy.
+rust-s3 = { workspace = true }
+# Azure Blob Storage snapshot backend (#585). See `src/azure_retention.rs` (Task 6).
+azure_core = { workspace = true }
+azure_storage = { workspace = true }
+azure_storage_blobs = { workspace = true }
+# `time` converts Azure's `time::OffsetDateTime` last-modified into chrono UTC
+# in `azure_retention.rs`. Already in the lockfile via the azure crates; this
+# just declares the direct use.
+time = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.5"
+tower-test = "0.4"
+http = "1"
+http-body-util = "0.1"
+# Scratch dirs for the filesystem usage-spill queue tests (#636 spill+replay).
+tempfile = { workspace = true }
+
+# Property-based testing for the retention reconciler's two-pass
+# idempotency (issue #186). Aliased to `hegel` per the workspace
+# declaration — the proc-macros hard-code that path.
+hegel = { workspace = true }
+
+# Real-recorder assertions for the warm-pool metrics (#288): the SDK's
+# `InMemoryMetricExporter` lets `tests/warm_pool_metrics.rs` install a live
+# meter provider and scrape the emitted points, proving the gauges/counters
+# fire on a real recorder (not just the no-op meter the unit tests exercise).
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+
+[[bin]]
+name = "sandbawks-controller"
+path = "src/bin/sandbawks-controller.rs"

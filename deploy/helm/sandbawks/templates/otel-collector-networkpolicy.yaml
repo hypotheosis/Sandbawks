@@ -1,0 +1,97 @@
+{{- /*
+NetworkPolicy restricting ingress to the in-namespace OTel Collector (issue #424).
+
+When `observability.collector.networkPolicy.enabled` is true, this policy limits
+which Pods may send OTLP signals to the collector, reducing the attack surface
+for signal injection from unrelated workloads in the release namespace.
+
+With split pipelines enabled (`observability.collector.splitPipelines.enabled`):
+  - Ports 4317/4318 (sandbox pipeline): only Pods carrying
+    `app.kubernetes.io/name=sandbawks-sandbox` (the label the controller stamps
+    on every sandbox Pod via SANDBOX_POD_LABEL_VALUE in pod_adapter.rs) may
+    connect. This matches sandbox Pods exclusively, not the chart's own
+    api/controller/node workloads.
+  - Ports 4319/4320 (internal pipeline): only Pods carrying the chart's own
+    selector labels (app.kubernetes.io/name=sandbawks + release instance) may
+    connect — the api, controller, and node Pods.
+
+Without split pipelines, all four ports collapse to 4317/4318, and BOTH sandbox
+and chart-internal Pods are allowed.
+
+Port 8686 (Vector's API /health endpoint) is left unrestricted because kubelet
+liveness/readiness probes originate from the node's host network, not from a
+Pod, and cannot be matched by a podSelector. The Prometheus scrape port
+(:9090, when enabled) is likewise left open so scrapers in another namespace can
+reach it.
+*/ -}}
+{{- if and .Values.observability.enabled .Values.observability.collector.enabled .Values.observability.collector.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "sandbawks.otelCollectorName" . }}
+  labels: {{- include "sandbawks.labels" . | nindent 4 }}
+spec:
+  # Target: the collector Pod(s) themselves.
+  podSelector:
+    matchLabels:
+      {{- include "sandbawks.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: otel-collector
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- if .Values.observability.collector.splitPipelines.enabled }}
+    # Sandbox pipeline (4317/4318): only sandbox Pods may send here.
+    # Sandbox Pods carry app.kubernetes.io/name=sandbawks-sandbox stamped by
+    # the controller (SANDBOX_POD_LABEL_VALUE in pod_adapter.rs).
+    - ports:
+        - port: 4317
+          protocol: TCP
+        - port: 4318
+          protocol: TCP
+      from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: sandbawks-sandbox
+    # Internal pipeline (4319/4320): only chart-managed api/controller/node
+    # Pods may send here. These carry the chart's selector labels
+    # (app.kubernetes.io/name=sandbawks + the release instance label).
+    - ports:
+        - port: 4319
+          protocol: TCP
+        - port: 4320
+          protocol: TCP
+      from:
+        - podSelector:
+            matchLabels:
+              {{- include "sandbawks.selectorLabels" . | nindent 14 }}
+    {{- else }}
+    # Single pipeline (splitPipelines.enabled=false): allow both sandbox Pods
+    # and chart-internal workloads on the shared receiver ports.
+    - ports:
+        - port: 4317
+          protocol: TCP
+        - port: 4318
+          protocol: TCP
+      from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: sandbawks-sandbox
+        - podSelector:
+            matchLabels:
+              {{- include "sandbawks.selectorLabels" . | nindent 14 }}
+    {{- end }}
+    # Health check port: unrestricted — kubelet probes arrive from the node's
+    # host network, which cannot be matched by a Kubernetes podSelector. Vector
+    # serves /health on its internal API port :8686 (#496).
+    - ports:
+        - port: 8686
+          protocol: TCP
+    {{- if .Values.observability.collector.prometheus.enabled }}
+    # Prometheus scrape port (#496 Phase 2): left open so a Prometheus running
+    # in another namespace can reach it. Tighten with a namespaceSelector for
+    # your monitoring namespace if scrapers are co-located.
+    - ports:
+        - port: {{ .Values.observability.collector.prometheus.port }}
+          protocol: TCP
+    {{- end }}
+{{- end }}

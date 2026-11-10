@@ -1,0 +1,501 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: sandboxes.sandbawks.dev
+spec:
+  group: sandbawks.dev
+  names:
+    categories: []
+    kind: Sandbox
+    plural: sandboxes
+    shortNames:
+    - sbx
+    singular: sandbox
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.annotations.sandbawks\.dev/claimed-at
+      name: Claimed
+      type: date
+    - jsonPath: .spec.templateRef
+      name: Template
+      type: string
+    - jsonPath: .spec.runtimeClassName
+      name: Runtime
+      type: string
+    - jsonPath: .status.assignedNode
+      name: Node
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for SandboxSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              The primary resource: one Sandbox = one E2B sandbox = one Pod (when running).
+
+              Naming the CRD plural `sandboxes` matches the english spelling expected by `kubectl get sandboxes` and by the E2B `/sandboxes` endpoint. Short name `sbx` matches E2B's sandbox ID prefix.
+            properties:
+              autoPause:
+                default: false
+                description: If true, the timeout transitions the sandbox to `Paused`. If false, the timeout transitions to `Terminating`.
+                type: boolean
+              desiredPhase:
+                description: |-
+                  Phase the API gateway wants the controller to drive toward.
+
+                  `Some(Paused)` requests pause; `Some(Running)` requests resume. Replaces the legacy `sandbawks.dev/desired-phase` annotation; the annotation reader is kept for one plan for backwards compatibility and removed in Plan 05.
+                enum:
+                - Creating
+                - Running
+                - Pausing
+                - Paused
+                - Resuming
+                - Terminating
+                - Failed
+                nullable: true
+                type: string
+              env:
+                additionalProperties:
+                  type: string
+                description: Environment variables injected into the sandbox process.
+                type: object
+              metadata:
+                additionalProperties:
+                  type: string
+                description: Opaque K/V passed through from the E2B API. Not interpreted by the controller — surfaced back via `GET /sandboxes`.
+                type: object
+              networkPolicy:
+                description: 'Optional egress policy. The controller materializes a `networking.v1.NetworkPolicy` selecting this sandbox''s Pod for **every** sandbox (issue #443); `None` here — like an empty `egressAllow` — leaves that policy at its default-deny-egress baseline. A non-empty `egressAllow` opens the listed destinations. Enforcement requires a NetworkPolicy-aware CNI (Cilium).'
+                nullable: true
+                properties:
+                  egressAllow:
+                    default: []
+                    description: |-
+                      Egress destinations to permit. Empty means deny-all egress (the default-deny baseline is unchanged).
+
+                      IP/CIDR entries (`10.0.0.0/8`, `2001:db8::1`) become exact `ipBlock` egress rules. DNS-name entries cannot be encoded as destinations in a standard NetworkPolicy, so their presence instead opens DNS egress (port 53) and relies on the cluster's name-aware CNI layer (Cilium FQDN policy) to enforce the resolved destination.
+                    items:
+                      type: string
+                    type: array
+                type: object
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: 'Node-selector labels stamped onto the sandbox Pod''s `spec.nodeSelector` so it is constrained to a labeled node pool (issue #592). Resolved from the template''s [`crate::SandboxTemplateSpec::node_selector`] alongside [`Self::tolerations`]; same override precedence and `None`-default semantics.'
+                nullable: true
+                type: object
+              persistenceMode:
+                description: |-
+                  How this sandbox's writable state survives a pause/resume cycle (epic #603). `None` inherits the template's [`crate::SandboxTemplateSpec::persistence_mode`] at the controller's pod-creation edge ([`resolve_pod_inputs`]); if neither is set the effective mode is [`PersistenceMode::Snapshot`] — the current behavior, unchanged. An explicit value on the CR always wins, the same override precedence as [`Self::runtime_class_name`] / [`Self::tolerations`].
+
+                  `Option<T>` keeps the field non-required in the generated CRD schema and `skip_serializing_if` keeps `None` out of serialized YAML rather than emitting `persistenceMode: null`.
+
+                  [`resolve_pod_inputs`]: ../../sandbawks_controller/reconcile/fn.resolve_pod_inputs.html
+                enum:
+                - Snapshot
+                - Filesystem
+                nullable: true
+                type: string
+              pvcRetention:
+                description: |-
+                  How long a *paused* [`PersistenceMode::Filesystem`] sandbox may keep its retained PVC(s) before the controller garbage-collects the whole Sandbox (cascading the PVCs via their ownerReferences) — epic #603 Phase 5 / issue #608. The `filesystem`-mode analog of [`Self::snapshot_retention`]: a snapshot-mode pause parks state as an S3 object under the existing snapshot retention sweep, but a filesystem-mode pause keeps a live PVC whose storage bills until something reclaims it.
+
+                  Encoded as an ISO-8601 duration string (`P7D`, `PT24H`, …), same wire shape as [`Self::snapshot_retention`]. The window is measured from the moment the sandbox finished suspending (the `Suspended` status condition's transition time), not from creation, so an actively resumed-and-re-paused sandbox keeps resetting its clock.
+
+                  Resolution order at GC time:
+
+                  1. `Sandbox.spec.pvcRetention` (this field). 2. Controller-wide default (`pvcRetention.defaultDuration` Helm value), gated behind the controller's `pvcRetention.enabled` switch.
+
+                  `None` means "fall through to the controller default"; explicit `Some` always wins. When PVC retention is disabled controller-wide (the default), paused filesystem sandboxes are never auto-collected and this field is inert.
+
+                  Parsed by [`crate::snapshot::parse_iso8601_duration`].
+                nullable: true
+                type: string
+              resources:
+                description: |-
+                  Per-sandbox resource budget.
+
+                  `cpu` and `memory` map directly onto a Pod's container `resources.limits`. `ephemeral_storage` maps to the Pod's ephemeral-storage limit (the snapshot delta of the sandbox's writable layer).
+                properties:
+                  cpu:
+                    type: string
+                  ephemeralStorage:
+                    nullable: true
+                    type: string
+                  memory:
+                    type: string
+                required:
+                - cpu
+                - memory
+                type: object
+              restoreFrom:
+                description: |-
+                  Clone-from-snapshot: stand this *new* sandbox up from the saved state of a *different* sandbox rather than cold-booting (issue #416).
+
+                  When set on a freshly-created sandbox, the controller — instead of booting a fresh container — restores the referenced source's last-good state, then transitions straight to `Running`. The mechanism follows the sandbox's [resolved persistence mode](resolve_effective_persistence_mode):
+
+                  - **`snapshot` mode** (gVisor S3 snapshot): the controller resolves the source's `status.snapshotRef` / digests, stamps them onto this sandbox's status, and drives the existing scheduler-placed restore flow (`Creating → Resuming → Stage → CreateRestorePod → Running`, epic #484). - **`filesystem` mode** (retained PVC, epic #603): each PVC this sandbox provisions is CSI-cloned from the source sandbox's correspondingly-named retained PVC via the PVC `dataSource`, then a fresh Pod cold-boots over the cloned volumes. The source must be `Suspended` (filesystem-paused) so its PVC is quiescent.
+
+                  The value is parsed by [`RestoreSource::parse`]:
+
+                  - a **source sandbox ID** (e.g. `sbx-warm-l5dkn`) — the controller looks up that Sandbox CR in the same namespace and reads the artifact it needs for the resolved mode. Works even if the source is `Failed`, as long as the source CR still exists with a snapshot recorded (snapshot mode) or its retained PVC(s) (filesystem mode). - a raw **`s3://…/manifest.json` URL** (snapshot mode, recovery path for a *deleted* source) — recognized but not yet actioned by the controller; it folds the sandbox to `Failed` with a message directing the operator to pass the source sandbox ID instead.
+
+                  Before restoring, the controller validates the source against this sandbox (runtime class; template image, warn-only for legacy snapshots) and refuses (`Failed` + condition) on mismatch. `None` (the default) is a normal cold-booted sandbox, unchanged.
+
+                  # Known limitation: cloned guest identity (snapshot mode)
+
+                  A gVisor `snapshot`-mode restore reconstructs the entire Sentry (guest kernel) from the checkpoint, so the **source's** in-kernel identity rides along: `gethostname(2)` / `uname -n`, the netstack interface MAC + IP, and any captured `/etc/machine-id` / boot-id all return the *source's* values in the clone. Meanwhile the kubelet-managed furniture binds (`/etc/hostname`, `/etc/hosts`, `/etc/resolv.conf`) reflect the *new* Pod — see [`RUNTIME_MANAGED_BIND_DESTS`] in the node's gVisor adapter — so a clone sees a split between its kernel hostname (source) and `/etc/hostname` (destination). This does **not** fail the restore (the resume path already restores into a fresh Pod with a different IP/MAC), but a workload that keys on hostname / machine-id / MAC (service registration, clustering, licensing) inherits the source's identity rather than getting a unique one. v1 avoids live *collisions* because a clone source is always quiescent (`Paused` / `Failed` for snapshot, `Suspended` for filesystem), so two identical identities are never on the wire at once.
+
+                  The reconciliation strategy for this is decided in the design spec `docs/superpowers/specs/2026-06-24-clone-guest-identity-reconcile-design.md` (issue #643): an `envd`-driven one-shot reset on snapshot-mode clones that rewrites the UTS hostname and regenerates `/etc/machine-id` & friends, while *accepting* the inherited netstack MAC/IP (the host veth carries the real L2/L3 identity). The controller marks a clone needing this reset with [`crate::labels::CLONE_IDENTITY_RESET_ANNOTATION`], gated by the pure predicate [`clone_needs_guest_identity_reset`].
+
+                  [`RUNTIME_MANAGED_BIND_DESTS`]: ../../sandbawks_node/gvisor/index.html
+                nullable: true
+                type: string
+              runtimeClassName:
+                description: Override the template's default RuntimeClass.
+                nullable: true
+                type: string
+              securityContext:
+                description: |-
+                  Pod-level security context stamped onto the sandbox Pod's `spec.securityContext` (issue #617) — most importantly `fsGroup`, so a non-root container can write to a dynamically provisioned `volumeClaimTemplates` PVC (which otherwise mounts `root:root`).
+
+                  Resolved from the template's [`crate::SandboxTemplateSpec::security_context`] at the controller's pod-creation edge ([`resolve_pod_inputs`]) alongside [`Self::tolerations`] / [`Self::node_selector`]; same override precedence (an explicit value on the CR wins; the template default only fills an empty slot) and `None`-default semantics — `None` leaves the Pod with no `securityContext`, exactly as before.
+
+                  [`resolve_pod_inputs`]: ../../sandbawks_controller/reconcile/fn.resolve_pod_inputs.html
+                nullable: true
+                properties:
+                  fsGroup:
+                    description: Supplemental GID that owns the Pod's volumes. The kubelet recursively chowns each volume to `root:fsGroup` with the setgid bit, so a container running as any UID that has this GID can write — the fix for a root-owned `volumeClaimTemplates` PVC.
+                    format: int64
+                    nullable: true
+                    type: integer
+                  fsGroupChangePolicy:
+                    description: 'When the kubelet applies [`Self::fs_group`] ownership: `Always` (chown every mount) or `OnRootMismatch` (skip when the top-level dir already matches — far cheaper for large, already-correct volumes).'
+                    nullable: true
+                    type: string
+                  runAsGroup:
+                    description: Primary GID every container in the Pod runs as.
+                    format: int64
+                    nullable: true
+                    type: integer
+                  runAsNonRoot:
+                    description: Require all containers to run as a non-root user; the kubelet refuses to start the Pod if a container would run as UID 0.
+                    nullable: true
+                    type: boolean
+                  runAsUser:
+                    description: UID every container in the Pod runs as (unless a container overrides it).
+                    format: int64
+                    nullable: true
+                    type: integer
+                  supplementalGroups:
+                    description: Extra GIDs added to every container's process, beyond the primary group.
+                    items:
+                      format: int64
+                      type: integer
+                    type: array
+                type: object
+              snapshotRetention:
+                description: |-
+                  How long to retain this sandbox's snapshot in the snapshot store after the controller writes it. Encoded as an ISO-8601 duration string (`P7D`, `PT24H`, `PT30M`, …) so the wire shape is the same one Kubernetes uses for `pod.spec.activeDeadlineSeconds`- adjacent time fields without locking us into a single unit.
+
+                  Resolution order at GC time:
+
+                  1. `Sandbox.spec.snapshotRetention` (this field). 2. Per-namespace annotation `sandbawks.dev/snapshot-retention`. 3. Controller-wide default (`snapshotStore.retention.defaultDuration` Helm value).
+
+                  `None` means "fall through to the namespace / controller default"; explicit `Some` always wins.
+
+                  Parsed by [`crate::snapshot::parse_iso8601_duration`].
+                nullable: true
+                type: string
+              templateRef:
+                description: Name of a `SandboxTemplate` in the same namespace.
+                type: string
+              timeoutSeconds:
+                description: |-
+                  The **idle window** in seconds: how long the sandbox may go with no client activity before it is auto-paused (if `auto_pause`) or killed (if not). Issue #481.
+
+                  The controller measures the window from [`SandboxStatus::last_activity_timestamp`] (falling back to `creationTimestamp` until the first activity stamp lands), so this is the *raw configured duration* — it does not grow with elapsed time. The gateway writes the caller's requested value verbatim on create, `set_timeout`, and warm-claim, and refreshes the activity baseline at each of those engagement points so "`N` seconds from now" holds.
+
+                  `0` is the "idle timeout disabled" sentinel (warm-pool members are minted with `0` and never auto-pause while unclaimed).
+                format: uint32
+                minimum: 0.0
+                type: integer
+              tolerations:
+                description: |-
+                  Scheduling tolerations stamped onto the sandbox Pod's `spec.tolerations` so it can land on tainted nodes (e.g. a dedicated Kata/Azure node pool that repels untolerated Pods) — issue #592.
+
+                  Resolved from the template's [`crate::SandboxTemplateSpec::tolerations`] at the controller's pod-creation edge ([`resolve_pod_inputs`] in `sandbawks-controller`), so both cold-start and warm-pool members inherit it. An explicit value on the CR wins; the template default only fills an empty slot — the same override precedence as [`Self::runtime_class_name`].
+
+                  `None` (the default) leaves the Pod with no extra tolerations, scheduled exactly as before. `Option<T>` keeps the field non-required in the generated CRD schema and `skip_serializing_if` keeps `None` out of serialized YAML rather than emitting `tolerations: null`.
+
+                  [`resolve_pod_inputs`]: ../../sandbawks_controller/reconcile/fn.resolve_pod_inputs.html
+                items:
+                  description: |-
+                    A pod scheduling toleration: a serde/schemars-friendly mirror of `k8s_openapi::api::core::v1::Toleration` (issue #592).
+
+                    We mirror rather than reuse the `k8s_openapi` type because this crate's CRDs derive [`schemars::JsonSchema`] to emit their OpenAPI v3 schema, and the `k8s-openapi` types do not implement `JsonSchema` under the features this workspace enables. The field set and wire shape (camelCase `tolerationSeconds`) match the upstream type exactly, so the controller converts losslessly into the `k8s_openapi` `Toleration` when building the `PodSpec`. See the same mirror rationale on [`NetworkPolicy`].
+                  properties:
+                    effect:
+                      description: Taint effect to match. Empty matches all effects. One of `NoSchedule`, `PreferNoSchedule`, `NoExecute`.
+                      nullable: true
+                      type: string
+                    key:
+                      description: 'Taint key the toleration applies to. Empty (with `operator: Exists`) matches all keys.'
+                      nullable: true
+                      type: string
+                    operator:
+                      description: Relationship between key and value. `Exists` (value must be empty) or `Equal` (the default when unset, per Kubernetes).
+                      nullable: true
+                      type: string
+                    tolerationSeconds:
+                      description: For a `NoExecute` toleration, how long (seconds) the Pod stays bound after the taint is added. Unset means tolerate forever.
+                      format: int64
+                      nullable: true
+                      type: integer
+                    value:
+                      description: 'Taint value the toleration matches (empty with `operator: Exists`).'
+                      nullable: true
+                      type: string
+                  type: object
+                nullable: true
+                type: array
+              volumeClaimTemplates:
+                description: |-
+                  Sandbox-owned `PersistentVolumeClaim` requests whose volumes outlive the Pod across a `filesystem`-mode pause (epic #603). `None` inherits the template's [`crate::SandboxTemplateSpec::volume_claim_templates`] at the pod-creation edge alongside [`Self::persistence_mode`]; an explicit value on the CR wins and the template default only fills an empty slot — same precedence as the scheduling hints.
+
+                  No controller behavior yet: the PVC objects are provisioned and mounted in #603 Phase 2. `None` (the default) leaves a sandbox with no extra volumes, exactly as today.
+                items:
+                  description: |-
+                    A request for a sandbox-owned `PersistentVolumeClaim`, modeled on a StatefulSet's / `kubernetes-sigs/agent-sandbox`'s `volumeClaimTemplates` (epic #603). Each entry yields one PVC the controller provisions and mounts into the sandbox Pod (#603 Phase 2); the PVC outlives the Pod across a `filesystem`-mode pause so the sandbox's files survive resume.
+
+                    [`Self::spec`] is a serde/schemars-friendly mirror of the subset of `k8s_openapi::api::core::v1::PersistentVolumeClaimSpec` a dynamically provisioned workspace volume needs. We mirror rather than embed the upstream type for the same reason as [`Toleration`] / [`NetworkPolicy`]: this crate's CRDs derive [`schemars::JsonSchema`] to emit their OpenAPI v3 schema, and the `k8s-openapi` types do not implement `JsonSchema` under the features this workspace enables. The field semantics match the upstream type, so the controller converts into a `k8s_openapi` PVC spec when provisioning (#603 Phase 2).
+                  properties:
+                    metadata:
+                      description: PVC object metadata. The `name` distinguishes this claim within the sandbox and seeds the materialized PVC's name (#603 Phase 2).
+                      properties:
+                        annotations:
+                          additionalProperties:
+                            type: string
+                          description: Extra annotations stamped onto the materialized PVC.
+                          type: object
+                        labels:
+                          additionalProperties:
+                            type: string
+                          description: Extra labels stamped onto the materialized PVC.
+                          type: object
+                        name:
+                          description: |-
+                            Volume name, unique within the sandbox. Combined with the sandbox name to form the materialized PVC's name and used as the Pod volume name when mounted (#603 Phase 2).
+
+                            Constrained to a **DNS-1123 label** (lowercase alphanumerics plus `-`, starting/ending alphanumeric, ≤63 chars) by the `pattern`/`maxLength` emitted into the CRD schema (#605 review). This is the *stricter* of the two downstream Kubernetes name rules the value must satisfy — it is used verbatim as the Pod **volume name** (a DNS-1123 label, no dots) and, with the `sbx-<id>` suffix, as the **PVC name** (a DNS-1123 subdomain) — so validating it as a label keeps both valid. Rejecting an invalid name at `kubectl apply` (admission) makes the failure diagnosable instead of surfacing later as an opaque apiserver rejection when the controller creates the PVC/Pod; the controller re-checks it (and cross-entry uniqueness) as defense in depth.
+                          maxLength: 63
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    spec:
+                      description: The volume's provisioning spec (size, access modes, storage class).
+                      properties:
+                        accessModes:
+                          description: Access modes (e.g. `ReadWriteOnce`). Empty defers to the StorageClass/provisioner default.
+                          items:
+                            type: string
+                          type: array
+                        storage:
+                          description: Requested storage size, mapped to `resources.requests.storage` on the materialized PVC (e.g. `10Gi`). Reuses [`ResourceQuantity`] so the lexical Kubernetes quantity form round-trips without precision loss.
+                          type: string
+                        storageClassName:
+                          description: StorageClass to provision from. `None` uses the cluster's default class.
+                          nullable: true
+                          type: string
+                        volumeMode:
+                          description: Volume mode (`Filesystem` or `Block`). `None` defers to the Kubernetes default (`Filesystem`).
+                          nullable: true
+                          type: string
+                      required:
+                      - storage
+                      type: object
+                  required:
+                  - metadata
+                  - spec
+                  type: object
+                nullable: true
+                type: array
+            required:
+            - resources
+            - templateRef
+            - timeoutSeconds
+            type: object
+          status:
+            description: Observed state of a Sandbox, written by the controller.
+            nullable: true
+            properties:
+              assignedNode:
+                description: Node currently hosting the sandbox Pod (None when Paused or Creating before scheduling).
+                nullable: true
+                type: string
+              conditions:
+                description: Free-form conditions in the conventional Kubernetes style.
+                items:
+                  description: Conventional Kubernetes-style status condition.
+                  properties:
+                    lastTransitionTime:
+                      nullable: true
+                      type: string
+                    message:
+                      nullable: true
+                      type: string
+                    reason:
+                      nullable: true
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - status
+                  - type
+                  type: object
+                type: array
+              envdAddress:
+                description: '`host:port` of the in-sandbox envd agent when running.'
+                nullable: true
+                type: string
+              failedAt:
+                description: 'RFC 3339 timestamp the Sandbox most recently entered `phase=Failed` (issue #510) — the anchor the tier-3 grace-period GC measures from when deciding whether an orphaned-but-unreachable Pod has been stuck long enough to reclaim. Stamped alongside [`Self::failure_reason`] at every `Failed` fold; cleared when a recoverable Sandbox is recovered back to `Running`. Stored as an RFC 3339 string to match the sibling timestamp fields. `None` until the first fold.'
+                nullable: true
+                type: string
+              failureReason:
+                description: 'Stable [`crate::FailureReason`] label of the fold that last drove this Sandbox into `phase=Failed` (issue #510). Distinguishes the *recoverable* pause-checkpoint failure class (`pause_checkpoint_failed`) — where the workload Pod may still be alive and the checkpoint simply did not happen — from genuinely terminal create/terminate failures, so the controller''s `Failed`-phase recovery probe can scope its retry/recover/GC behavior to the former and leave the latter terminal. `None` for a Sandbox that has never folded to `Failed` (and for CRs written by a controller predating this field).'
+                nullable: true
+                type: string
+              lastActivityTimestamp:
+                description: |-
+                  RFC 3339 timestamp of the last observed client activity against the sandbox (issue #481). The API gateway stamps this (throttled) on every proxied envd request — filesystem, process, exec/pty streams — so the controller can treat `spec.timeoutSeconds` as an *idle* window rather than an absolute deadline: a `Running` sandbox is auto-paused / auto-terminated only once `now - lastActivityTimestamp` exceeds the window, not once `creationTimestamp + timeoutSeconds` elapses regardless of use.
+
+                  `None` means "no activity stamped yet"; the controller then falls back to `creationTimestamp` as the idle baseline so a freshly-claimed-but-untouched sandbox still ages out (no regression for abandoned claims). Stored as an RFC 3339 string to match the sibling [`Self::last_transition_time`] convention (the controller parses it back via `DateTime::parse_from_rfc3339`).
+                nullable: true
+                type: string
+              lastTransitionTime:
+                description: RFC 3339 timestamp of the last phase transition.
+                nullable: true
+                type: string
+              pauseLastAttempt:
+                description: 'RFC 3339 timestamp of the most recent pause-checkpoint (re)dispatch for the current `Pausing` cycle — the anchor the tier-1 retry loop''s capped exponential backoff measures from (issue #510). `None` until the first attempt is stamped. Stored as an RFC 3339 string to match the sibling [`Self::resume_last_attempt`] convention.'
+                nullable: true
+                type: string
+              pauseRestartCount:
+                default: 0
+                description: |-
+                  Number of times the controller has re-dispatched the pause checkpoint for the *current* `Pausing` cycle, used by the bounded pause-checkpoint retry loop (issue #510, tier 1). A fresh `Running → Pausing` transition resets this to `0`; each `PauseRetry` recovery increments it. Once it reaches `PAUSE_MAX_RETRIES` the controller folds the Sandbox to `Failed` with [`crate::FailureReason`]`::PauseCheckpointFailed` instead of retrying forever — but, unlike a genuine create/terminate failure, that fold stays *recoverable* (see [`Self::failure_reason`]).
+
+                  `u32`, not `Option<u32>`, for the same reason as [`Self::resume_restart_count`]: the count is meaningful (and zero) the moment a Sandbox enters `Pausing`. `#[serde(default)]` makes a `SandboxStatus` deserialized from an older controller's CR read back as `0`.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              phase:
+                default: Creating
+                description: Lifecycle phase. See spec §5 for transitions.
+                enum:
+                - Creating
+                - Running
+                - Pausing
+                - Paused
+                - Resuming
+                - Terminating
+                - Failed
+                type: string
+              podRef:
+                description: Reference to the backing Pod, if any.
+                nullable: true
+                type: string
+              podStatus:
+                description: |-
+                  Projection of the backing Pod's observed phase while the Sandbox is not yet serving envd, written by the controller for the API gateway's "still starting / not ready yet" notice (issue #625).
+
+                  The gateway watches `Sandbox` CRs but deliberately holds no pod-read RBAC (#442), so it cannot inspect the Pod itself. The controller — which already observes the Pod every reconcile — distills the pod-level signal the gateway needs to turn a tool call racing a not-yet-ready sandbox into an actionable notice (and to tell a transient "still starting, retry shortly" apart from a stuck `ImagePullBackOff` / `CrashLoopBackOff` that will not recover without intervention).
+
+                  `None` once envd is serving (the gateway routes normally and never consults it) and for CRs written by a controller predating this field.
+                nullable: true
+                properties:
+                  message:
+                    description: Human-readable detail accompanying [`Self::reason`] — the kubelet's container `state.waiting.message` / `state.terminated.message` — when present. Carried verbatim into the gateway notice so the LLM driving a harness sees the concrete cause (e.g. the unpullable image ref).
+                    nullable: true
+                    type: string
+                  phase:
+                    description: '`Pod.status.phase` verbatim — `Pending` / `Running` / `Succeeded` / `Failed` / `Unknown`. `Unknown` when the kubelet has not reported a phase yet (the Pod exists but has no `status.phase`).'
+                    type: string
+                  reason:
+                    description: The most significant container *waiting* or *terminated* reason that is blocking the Pod from serving, when one exists — e.g. `ImagePullBackOff`, `ErrImagePull`, `CrashLoopBackOff`, `CreateContainerError`, `RunContainerError`. `None` while the Pod is merely scheduling / pulling with no error reported yet (a healthy, still-progressing cold start or restore).
+                    nullable: true
+                    type: string
+                required:
+                - phase
+                type: object
+              podUid:
+                description: UID stamped onto the Pod by the kube API server (mirrored from `Pod.metadata.uid` once the controller observes the Pod). Lets the gateway disambiguate Pods if the CR name is reused.
+                nullable: true
+                type: string
+              restoreStagingPath:
+                description: Local filesystem path on the staging node where a `Stage` `SnapshotJob` materialized the snapshot's parts, copied from the completing job's [`crate::SnapshotJobStatus::local_path`] (Plan 07 T9). The controller threads this into the restore Pod's `io.sandbawks/restore-image-path` annotation so the `containerd-shim` performs a start-time `runsc restore` from it — the sandbox is born restored rather than restored after boot. Set on the `(Resuming, StageComplete)` edge and consumed by `Action::CreateRestorePod`.
+                nullable: true
+                type: string
+              resumeLastAttempt:
+                description: |-
+                  RFC 3339 timestamp of the most recent restore-Pod (re)creation attempt for the current resume — the anchor the recovery loop's capped exponential backoff measures its delay from (epic #484), and an observability breadcrumb for how long a `Resuming` Sandbox has been retrying. `None` until the first attempt is stamped.
+
+                  Stored as an RFC 3339 string to match the sibling [`Self::last_transition_time`] / [`Self::last_activity_timestamp`] convention (the controller parses it back via `DateTime::parse_from_rfc3339`) rather than a typed `Time`, so all status timestamps round-trip through one code path.
+                nullable: true
+                type: string
+              resumeRestartCount:
+                default: 0
+                description: |-
+                  Number of times the controller has (re)created the restore Pod for the *current* resume, used by the bounded `Resuming` recovery loop (epic #484). A fresh `Paused → Resuming` transition resets this to `0`; each `RestorePodLost` recovery increments it. Once it exceeds `RESUME_MAX_RESTARTS` the controller folds the Sandbox to `Failed` with [`crate::FailureReason`]`::ResumeExhausted` rather than retrying forever (the `resumingforever` hang this epic fixes).
+
+                  `u32`, not `Option<u32>`: the count is meaningful (and zero) the moment a Sandbox enters `Resuming`, so a sentinel "unset" state would be indistinguishable from "no restarts yet". `#[serde(default)]` makes a `SandboxStatus` deserialized from an older controller's CR (which never wrote the field) read back as `0`.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              snapshotEnvdSha256:
+                description: 'sha256 of the node-staged envd binary the snapshot referenced by `snapshot_ref` was checkpointed against. Folded in from the completing Pause `SnapshotJob`''s `status.manifest.envd_sha256` so the controller has a stable value to commit when dispatching the next Resume/Stage job (issue #278 hardening — binds the envd dimension to a value the node DaemonSet cross-checks against the re-fetched manifest before `verify_envd_digest`, mirroring `snapshot_sha256` / issue #171 for the aggregate digest).'
+                nullable: true
+                type: string
+              snapshotJobRef:
+                description: Name of the in-flight `SnapshotJob` CR driving the current pause or resume, when one exists. Cleared by the controller when the job reaches a terminal phase.
+                nullable: true
+                type: string
+              snapshotRef:
+                description: S3 URL of the snapshot when Paused.
+                nullable: true
+                type: string
+              snapshotRunscVersion:
+                description: |-
+                  Host `runsc` (gVisor) release token the snapshot referenced by `snapshot_ref` was checkpointed against (e.g. `release-20260525.0`). Folded in from the completing Pause `SnapshotJob`'s `status.manifest.runsc_version` (#545, Capability B).
+
+                  gVisor checkpoint/restore requires the *exact* same runsc build on both ends, so on the next Resume the controller constrains the restore Pod's `nodeAffinity` to nodes advertising this version via [`crate::RUNSC_VERSION_LABEL`]. A mismatched fleet then leaves the restore Pod `Pending` (diagnosable, recoverable) instead of crash-looping `runsc restore` with a fatal version mismatch.
+
+                  `None` for Sandboxes paused before this field existed and for a pause whose node could not read its host runsc version; the restore gate then degrades to envd-staged affinity only, matching the pre-#545 ungated placement.
+                nullable: true
+                type: string
+              snapshotSha256:
+                description: 'Aggregate sha256 of the snapshot referenced by `snapshot_ref`. Folded in from the completing Pause `SnapshotJob`''s `status.manifest.sha256` so the controller has a stable fingerprint to commit to when dispatching the next Resume job (issue #171 hardening — binds the snapshot URL to a value the node DaemonSet can cross-check against the re-fetched manifest).'
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: Sandbox
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

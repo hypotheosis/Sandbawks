@@ -1,0 +1,60 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: teamapikeys.sandbawks.dev
+spec:
+  group: sandbawks.dev
+  names:
+    categories: []
+    kind: TeamAPIKey
+    plural: teamapikeys
+    shortNames:
+    - tak
+    singular: teamapikey
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.keyPrefix
+      name: Prefix
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for TeamApiKeySpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Authenticates a team at the sandbawks-api ingress and names the tenant namespace it is scoped to.
+
+              The CR itself lives in the **system namespace** (alongside the controller), out of tenant reach; `spec.namespace` names the tenant namespace the key authorizes, and the api resolves `TeamContext.namespace` from that field — not from the CR's own `metadata.namespace` (#583).
+
+              We store **only the hash** of the key, never the key itself. The 8-char prefix is indexed so a lookup is O(1) instead of scanning every key on every API call; the rest of the key is then constant-time-compared against the stored hash.
+
+              The full key is shown to the user exactly once at issue time and is not recoverable.
+            properties:
+              keyHash:
+                description: SHA-256 hex digest of the full key, prefixed `"sha256:"`.
+                type: string
+              keyPrefix:
+                description: First 8 characters of the issued key, e.g. `"sbk_a1b2"`.
+                type: string
+              namespace:
+                description: The tenant Kubernetes namespace this key authorizes. The api resolves `TeamContext.namespace` from this field (not from the CR's own `metadata.namespace`), so the key itself lives in the system namespace, out of tenant reach (#583).
+                type: string
+              scopes:
+                description: Scope strings. MVP only honours `sandboxes:*`; additional scopes are reserved for later plans.
+                items:
+                  type: string
+                type: array
+            required:
+            - keyHash
+            - keyPrefix
+            - namespace
+            type: object
+        required:
+        - spec
+        title: TeamAPIKey
+        type: object
+    served: true
+    storage: true
+    subresources: {}

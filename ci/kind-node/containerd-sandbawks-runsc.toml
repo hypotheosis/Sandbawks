@@ -1,0 +1,48 @@
+# Fragment appended to `/etc/containerd/config.toml` by
+# `ci/kind-node/Dockerfile` at image build time, registering the sandbawks
+# custom shim as a CRI runtime handler under the name `sandbawks-runsc`.
+#
+# This file is NOT a conf.d/ drop-in — kind's containerd config doesn't
+# set `imports = [...]`, so nothing under `/etc/containerd/conf.d/`
+# would ever be loaded. The Dockerfile instead concatenates this
+# fragment onto the primary config; see the comment block above the
+# matching `RUN cat ... >> ...` step in the Dockerfile. This mirrors the
+# sibling `containerd-runsc.toml` fragment exactly.
+#
+# Consumed by the `RuntimeClass: sandbawks-runsc` resource (Plan 07 T6)
+# whose `handler:` field MUST equal the table key here (`sandbawks-runsc`).
+# Pods that opt into `runtimeClassName: sandbawks-runsc` are then scheduled
+# with this handler instead of the default `io.containerd.runc.v2`.
+#
+# Handler name vs. runtime_type — these are two different identifiers:
+#
+#   - The table key (`sandbawks-runsc`) is the *handler name*. It is an
+#     arbitrary label that the RuntimeClass points at; it can be anything.
+#   - `runtime_type` is how containerd locates the shim *binary*. Containerd
+#     maps `io.containerd.<name>.<version>` to `containerd-shim-<name>-<version>`
+#     on `$PATH`. Our binary is `containerd-shim-sandbawks-v1`, so the type
+#     MUST be `io.containerd.sandbawks.v1` (name `sandbawks`, version `v1`) —
+#     this is also the manager name the shim registers in
+#     `shim/cmd/containerd-shim-sandbawks-v1/main.go`.
+#
+# Note: the runtime_type is intentionally `io.containerd.sandbawks.v1`, NOT
+# `io.containerd.sandbawks-runsc.v1`. The latter would resolve to a binary
+# named `containerd-shim-sandbawks-runsc-v1`, which does not exist; pod
+# sandbox creation would then fail with "binary not installed". The handler
+# is still *named* `sandbawks-runsc` (the table key) to match the
+# RuntimeClass — only the type tracks the shipped binary name.
+
+# `pod_annotations` allowlists the pod-metadata annotation keys that
+# containerd's CRI plugin copies into each container's OCI runtime spec
+# (`config.json`) — the same mechanism gVisor documents for its own
+# `dev.gvisor.*` annotations. Without it, a pod annotation never reaches
+# the container bundle, so `containerd-shim-sandbawks-v1` reads an empty
+# `io.sandbawks/restore-image-path` from `config.json` and falls back to a
+# plain cold-start `Create` (no `CreateWithFSRestore`/`Restore`) — the
+# container comes up on the base image instead of being restored from its
+# snapshot, silently losing the resumed filesystem + memory. The controller
+# stamps the restore-image-path annotation on the restore Pod (Plan 07 T9);
+# this entry is what lets the shim actually see it at Create time.
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sandbawks-runsc]
+  runtime_type = "io.containerd.sandbawks.v1"
+  pod_annotations = ["io.sandbawks/restore-image-path"]

@@ -1,0 +1,973 @@
+# Image references — overridden in production deployments.
+#
+# `tag` is left BLANK on purpose for all three first-party images (issue #523).
+# A blank tag falls back to the chart's `appVersion` at render time
+# (`tag | default .Chart.AppVersion` in each Deployment/DaemonSet template), and
+# `appVersion` is injected from the Cargo workspace version when the chart is
+# packaged (chart-publish.yaml `helm package --app-version`). A release `v*` tag
+# also publishes the images at a matching `type=semver` tag (kind-smoke.yaml), so
+# a freshly pulled chart's `helm template` references `:<appVersion>` — images
+# that actually exist — instead of a stale hardcoded placeholder that never
+# tracked the code. CI (kind-smoke) and production still pin an explicit immutable
+# tag via `--set images.<svc>.tag=<sha>`; set `tag` here only to override that
+# appVersion default.
+images:
+  api:
+    repository: ghcr.io/hypotheosis/sandbawks-api
+    tag: ""
+    pullPolicy: IfNotPresent
+  controller:
+    repository: ghcr.io/hypotheosis/sandbawks-controller
+    tag: ""
+    pullPolicy: IfNotPresent
+  node:
+    repository: ghcr.io/hypotheosis/sandbawks-node
+    tag: ""
+    pullPolicy: IfNotPresent
+  # NOTE (epic #484): there is no `stageGate` image. Scheduler-placed restore
+  # waits for the node to finish staging inside the restore shim
+  # (`containerd-shim-sandbawks-v1`, baked into the node image), not via a Pod
+  # init container — a gVisor memory checkpoint restores as a whole sandbox and
+  # rejects any container absent from the checkpoint, so a stage-gate init
+  # container is incompatible with restore.
+
+api:
+  # Toggle the api Deployment + Service (and its RBAC). Default true for
+  # backward compatibility; CI smoke tests flip this off until the api
+  # crate exists (Plan 04).
+  enabled: true
+  replicas: 2
+  # Default kubernetes namespace the api gateway reads/writes Sandbox CRs
+  # in when a request doesn't pin one. Surfaced as SANDBAWKS_DEFAULT_NAMESPACE.
+  # Leave empty to track the release namespace (where the controller watches);
+  # set an explicit namespace only if the api and controller are split apart.
+  defaultNamespace: ""
+  # Wildcard base domain for E2B hostname-based sandbox selection (issue #364).
+  # Surfaced as SANDBAWKS_SANDBOX_DOMAIN. When set (e.g. "e2b.example.com"), the
+  # gateway resolves the target sandbox from a `{port}-{sandbox_id}.{domain}`
+  # request Host — the scheme the official E2B SDKs use — falling back to the
+  # `E2b-Sandbox-Id` header. When the api Ingress is enabled, the chart also
+  # renders a matching `*.{domain}` host automatically (see `api-ingress.yaml`),
+  # so this value is the single source of truth for both the gateway's parse
+  # domain and the Ingress routing rule. Leave empty for header-only routing
+  # (localhost / kind / port-forward).
+  sandboxDomain: ""
+  # Max seconds the gateway parks a *plain* not-ready process.Start before
+  # emitting the #625 retry notice. Silent (no keepalive — there is no process
+  # yet), so keep it under your ingress/LB idle timeout. Surfaced as
+  # SANDBAWKS_ENVD_SILENT_PARK_MAX_SECS.
+  envdSilentParkMaxSecs: 15
+  # Max seconds the gateway honors a leading `sleep <x>` on a not-ready sandbox,
+  # parking with keepalives before re-signalling the agent to resend (issue
+  # #641). Keepalive-protected, so it may exceed the idle timeout; the client's
+  # own commands.run(timeout=...) is the real bound. Surfaced as
+  # SANDBAWKS_ENVD_SLEEP_HONOR_MAX_SECS.
+  envdSleepHonorMaxSecs: 300
+  signingSecret:
+    # Point at a pre-existing Secret (containing a `signing-secret` key)
+    # to disable the chart-managed auto-generated secret. Leaving this
+    # blank lets the chart render `api-signing-secret.yaml`, which rotates
+    # the value on every `helm upgrade --install` — fine for MVP, not
+    # for production.
+    existingSecret: ""
+  service:
+    type: ClusterIP
+    port: 8080
+  # External exposure via an Ingress. Disabled by default: most clusters
+  # front the api differently (Ingress controller, Gateway API, mesh), and
+  # exposing the gateway is an explicit operator decision, not a default.
+  # When enabled, `api-ingress.yaml` routes the listed hosts/paths to the
+  # `sandbawks-api` Service on `.service.port`.
+  ingress:
+    enabled: false
+    # IngressClass to bind (e.g. "nginx", "traefik"). Blank leaves it unset
+    # so the cluster's default IngressClass applies.
+    className: ""
+    # Controller-specific annotations (TLS issuer, body size, rewrites, ...).
+    annotations: {}
+    hosts:
+      - host: sandbawks.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+      # Note: when `api.sandboxDomain` is set, the chart automatically adds a
+      # `*.{domain}` host here for E2B hostname-based selection (issue #364) —
+      # no manual entry needed. List additional hosts above only for other
+      # routing needs.
+    # TLS blocks, passed through verbatim to `Ingress.spec.tls`. Example:
+    #   - hosts: [sandbawks.example.com]
+    #     secretName: sandbawks-api-tls
+    # A wildcard cert (e.g. via cert-manager) is required to terminate TLS for
+    # the `*.{domain}` host above — that is an operator/deploy concern.
+    tls: []
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits:   { cpu: "1",  memory: 512Mi }
+
+controller:
+  # Toggle the controller Deployment (and its RBAC). Default true.
+  enabled: true
+  replicas: 1   # leader-elected; can scale for HA
+  logLevel: info
+  # Runtime adapter the controller uses to materialize Sandbox CRs:
+  #   `pod`  — Plan 04 T5 PodAdapter (issues POST /pods against kube).
+  #   `fake` — in-memory adapter (test/dev only).
+  runtime: pod
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits:   { cpu: "1",  memory: 512Mi }
+  # Leader election (issue #436). When enabled, multiple controller replicas
+  # coordinate via a `coordination.k8s.io/v1` Lease; only the elected leader
+  # runs the reconcile loops and the snapshot-retention sweeper. Standbys
+  # idle in the acquire loop and take over within one `leaseDurationSeconds`
+  # window if the leader's Pod is evicted or its node fails.
+  #
+  # `replicas: 1` (the default) works unchanged whether or not leader election
+  # is enabled — the single Pod just always wins the Lease immediately.
+  #
+  # To enable HA:
+  #   1. Set `controller.replicas` to 2 (or more).
+  #   2. Set `controller.leaderElection.enabled: true`.
+  #
+  # Tuning guidance:
+  #   leaseDurationSeconds  — Lease TTL; standbys wait up to this long before
+  #                           taking over a silent leader. 15 s is the upstream
+  #                           kube-controller-manager default.
+  #   renewDeadlineSeconds  — How long the leader tries to renew before giving
+  #                           up and exiting. Must be < leaseDurationSeconds.
+  #   retryPeriodSeconds    — How often standbys poll and the leader renews.
+  #                           Must be < renewDeadlineSeconds.
+  #
+  # The chart fails the render (`helm template`/`install`) if `replicas > 1`
+  # while `leaderElection.enabled` is false — that combination would
+  # double-reconcile. The timing values are validated again at controller
+  # startup: `0 < retryPeriodSeconds < renewDeadlineSeconds < leaseDurationSeconds`,
+  # and a violation fails the Pod fast instead of running a never-renewable Lease.
+  #
+  # TAKEOVER LATENCY: a graceful leader shutdown (SIGINT on a rolling restart)
+  # does NOT delete the Lease, so a standby waits up to one `leaseDurationSeconds`
+  # before taking over — the same TTL-bounded gap as the eviction / node-failure
+  # path. Size `leaseDurationSeconds` with that worst-case handover in mind.
+  leaderElection:
+    enabled: false
+    leaseName: sandbawks-controller-leader
+    leaseDurationSeconds: 15
+    renewDeadlineSeconds: 10
+    retryPeriodSeconds: 2
+  # Scheduler-placed restore tuning (epic #484, issue #490). These knobs were
+  # compile-time constants in `reconcile.rs`; surfacing them lets a cluster
+  # (notably the kind smoke/bench) tune the `Resuming` recovery loop without a
+  # rebuild. Each is rendered as an env var on the controller Deployment.
+  #
+  # The defaults below intentionally mirror the binary's compile-time `DEFAULT_*`
+  # constants (the `RESUME_*` values in `crates/sandbawks-controller/src/reconcile.rs`)
+  # so an unset/templated value behaves identically to no override. That
+  # alignment is maintained BY HAND — there is no test asserting the chart
+  # defaults equal the Rust constants — so if you change one side, change the
+  # other.
+  restore:
+    # NOTE: the restore *staging* timeout (how long to wait for the node's
+    # `.staged` marker) is NOT set here. That wait lives in the restore shim
+    # (`containerd-shim-sandbawks-v1`), which reads `SANDBAWKS_STAGE_GATE_TIMEOUT_SECS`
+    # from its own process env (it runs as the containerd runtime handler, not a
+    # Pod) and defaults to 300s. The knobs below are the controller-side
+    # `Resuming` recovery loop, which is independent of that shim gate.
+    # `SANDBAWKS_RESUME_SCHEDULE_DEADLINE_SECS` — how long a restore Pod may sit
+    # Pending (unscheduled, no node had capacity) before the recovery loop
+    # recreates it unpinned so the scheduler re-attempts placement.
+    scheduleDeadlineSeconds: 120
+    # `SANDBAWKS_RESUME_READY_DEADLINE_SECS` — how long a *scheduled* restore Pod
+    # may stay not-Ready before the recovery loop treats the restore as wedged
+    # and recreates it. The kind smoke tunes this down so the bounded-recovery
+    # path is exercised inside the resume wait budget.
+    readyDeadlineSeconds: 120
+    # `SANDBAWKS_RESUME_MAX_RESTARTS` — cap on restore-Pod recreations before the
+    # Sandbox folds to `Failed` (`ResumeExhausted`). This finite budget is what
+    # turns the old unbounded `resumingforever` hang into a terminal failure.
+    maxRestarts: 5
+
+  # Bounded recovery for fail-closed pause-checkpoint failures (issue #510).
+  # When an auto-pause checkpoint fails, the controller leaves the workload Pod
+  # running (so a live workload isn't destroyed) and folds the Sandbox to a
+  # *recoverable* `Failed`. These knobs bound the tiered retry → recover → GC
+  # path that reconciles that orphaned state. The defaults mirror the binary's
+  # compile-time `DEFAULT_PAUSE_MAX_RETRIES` / `DEFAULT_FAILED_GC_GRACE`
+  # constants (`crates/sandbawks-controller/src/reconcile.rs`); the alignment is
+  # maintained BY HAND, so change both sides together.
+  pauseRecovery:
+    # `SANDBAWKS_PAUSE_MAX_RETRIES` — how many times a failed pause checkpoint is
+    # re-dispatched (with capped backoff) before the Sandbox folds to `Failed`.
+    # A single transient `/__state` timeout should not be terminal.
+    maxRetries: 3
+    # `SANDBAWKS_FAILED_GC_GRACE_SECS` — how long an orphaned Pod whose envd is
+    # unreachable may linger before the controller GCs it to reclaim the node
+    # slot. Never applies while envd is still serving — a healthy Pod is
+    # recovered to `Running` instead.
+    gcGraceSeconds: 300
+
+  # PVC retention GC for paused `filesystem`-mode sandboxes (epic #603 Phase 5
+  # / issue #608). A snapshot-mode pause parks state as an S3 object swept by
+  # `snapshotStore.retention`; a `filesystem`-mode pause instead keeps a live
+  # PVC whose storage bills until reclaimed. When enabled, the controller
+  # deletes a paused `persistenceMode: filesystem` sandbox once it has sat past
+  # its retention window — cascading the retained PVC(s) via their
+  # ownerReferences. Resolution order: `Sandbox.spec.pvcRetention` →
+  # `defaultDuration` below.
+  pvcRetention:
+    # `SANDBAWKS_PVC_RETENTION_ENABLED` — master switch. Enabled here so paused
+    # filesystem sandboxes are auto-collected after `defaultDuration` (or their
+    # own `spec.pvcRetention`). NOTE: this is a *destructive* time-driven
+    # deletion of a paused Sandbox and its PVC data — set back to `false` (or
+    # raise `defaultDuration`) if you would rather reclaim paused PVCs manually.
+    enabled: true
+    # `SANDBAWKS_PVC_RETENTION_DEFAULT_DURATION` — ISO-8601 window applied to a
+    # paused filesystem sandbox that does not set its own `spec.pvcRetention`.
+    defaultDuration: P7D
+
+  # FQDN egress enforcement (issue #541). A DNS-name entry in a sandbox's
+  # `egressAllow` only opens DNS (port 53) under the baseline
+  # `networking.v1.NetworkPolicy` — that policy type has no FQDN field, so it
+  # cannot authorize the *resolved* L3 connection. When enabled here, the
+  # controller additionally materializes a per-sandbox Cilium `toFQDNs`
+  # CiliumNetworkPolicy so the name's resolved address is permitted.
+  #
+  # Enable ONLY on a Cilium cluster whose `CiliumNetworkPolicy` CRD is
+  # installed. Left disabled (the default), DNS-name entries degrade to the
+  # DNS-port-only baseline with no regression, and no `cilium.io` RBAC is
+  # granted. Enabling also grants the controller write access to
+  # `ciliumnetworkpolicies` (see templates/rbac.yaml).
+  fqdnEgress:
+    enabled: false
+    # Namespace the cluster DNS resolver runs in. The materialized policy needs
+    # a DNS-visibility rule pointing at it so Cilium's DNS proxy can learn the
+    # name→IP mappings `toFQDNs` enforces. Defaults to the stock kubeadm/k3s
+    # placement; override for non-standard resolver deployments (no hardcode).
+    dnsNamespace: kube-system
+    # `key=value` pod label selecting the cluster DNS resolver, used by the same
+    # DNS-visibility rule. Defaults to the label CoreDNS and kube-dns both
+    # carry. A malformed value (no `=`) falls back to this default.
+    dnsPodLabel: k8s-app=kube-dns
+
+node:
+  # Toggle the node DaemonSet (and its RBAC). Default true; CI smoke
+  # tests flip this off until the node crate exists (Plan 05).
+  enabled: true
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits:   { cpu: "2",  memory: 1Gi }
+  # Scheduling knobs for the node DaemonSet (#594). The DaemonSet controller
+  # already tolerates the stock node-condition taints, but NOT custom pool
+  # taints — so to run on a dedicated runtime pool (e.g. an AKS Kata pool
+  # tainted `kata=true:NoSchedule`) the DS must tolerate it, else the node
+  # never stages envd / advertises `sandbawks.dev/envd-staged` and sandbox
+  # Pods pinned there by the RuntimeClass nodeSelector wedge in Pending.
+  # Both default empty (no scheduling change). Example for an AKS Kata pool:
+  #   tolerations:
+  #     - key: kata
+  #       operator: Equal
+  #       value: "true"
+  #       effect: NoSchedule
+  tolerations: []
+  nodeSelector: {}
+  # Sandbox runtime profile this node pool serves (#594) — the SINGLE knob for
+  # Kata. Unset (default) → gVisor: `runsc checkpoint`/`restore` and the `runsc`
+  # staging-gate handler (#417). Set `runtime: kata` on a Kata pool and the node
+  # both (a) drives the sandbox's Cloud Hypervisor VMM (`vm.snapshot`/restore)
+  # for pause/resume and (b) gates `envd-staged` on the `kata` CRI handler — no
+  # second value to keep in sync. Without it the node runs the gVisor pause flow
+  # against a Kata sandbox and every pause fails at the `envd /__state` fetch.
+  # Cluster-wide per DaemonSet, so a mixed gVisor/Kata cluster runs one node
+  # deployment per pool. Accepted: "" (gvisor) | gvisor | kata | kata-fc.
+  runtime: ""
+  # OPTIONAL override of the CRI handler the `envd-staged` gate matches in a
+  # node's `status.runtimeHandlers`. Normally derived from `runtime` (gvisor →
+  # `runsc`, kata → `kata`), so leave unset. Set it only when the registered
+  # handler differs from that default — e.g. confidential Kata registers
+  # `kata-cc`, or an operator renamed the RuntimeClass handler. Must match the
+  # `handler:` of the RuntimeClass the Sandboxes on this pool use.
+  runtimeHandler: ""
+  # Host containerd run + data roots the node DaemonSet bind-mounts. These
+  # default to the upstream/stock containerd layout; only the host *source*
+  # paths change per distro.
+  #
+  # `hostPathContainerdRun` is mounted at the fixed in-container `/run/containerd`
+  # (the node resolves the containerd socket + runsc state root relative to it).
+  # `hostPathContainerdData` is mounted at the SAME in-container path as its host
+  # value (`mountPath == hostPath`), because the snapshotter reports the overlay
+  # upperdir as a host-absolute path under the data root — mounting it there lets
+  # the node read it verbatim with no path translation, so the same image works
+  # on any distro's data root (issue #389). Override for embedded-containerd
+  # distros:
+  #   k3s : hostPathContainerdRun=/run/k3s/containerd
+  #         hostPathContainerdData=/var/lib/rancher/k3s/agent/containerd
+  #   RKE2: hostPathContainerdRun=/run/k3s/containerd
+  #         hostPathContainerdData=/var/lib/rancher/rke2/agent/containerd
+  # Find them on a node with: `ls -l /run/*/containerd/containerd.sock`.
+  hostPathContainerdRun: /run/containerd
+  hostPathContainerdData: /var/lib/containerd
+  # In-container `--root` the node passes to every `runsc checkpoint` /
+  # `runsc restore`: the directory where the `io.containerd.runsc.v1` shim
+  # keeps each container's state. This is a path *inside* the node container,
+  # resolved against the `containerd-run` mount above (whose host source is
+  # `hostPathContainerdRun`). Surfaced to the binary as SANDBAWKS_RUNSC_ROOT.
+  #
+  # The default matches the stock-containerd shim layout. k3s/RKE2 place the
+  # runsc state under a different subtree, so leaving this at the default
+  # there makes every pause fail with the opaque `runsc checkpoint ...
+  # FetchSpec failed: loading container: file does not exist` even though the
+  # container ID is correct (issue #343). To fix: find the real root on an
+  # affected node with
+  #   find /run -maxdepth 4 -name '<container-id>' -type d
+  # then set this to the path that resolves to it *inside the container*
+  # (i.e. relative to `hostPathContainerdRun` being mounted at
+  # `/run/containerd`). If the state lives outside that mount entirely, also
+  # repoint `hostPathContainerdRun` so the directory is visible.
+  runscRoot: /run/containerd/runsc/k8s.io
+  # Per-environment fallback runsc `--root` candidates (issue #366), probed in
+  # order *after* `runscRoot` until one is found to actually hold the target
+  # container. Surfaced to the binary as SANDBAWKS_RUNSC_ROOT_FALLBACKS
+  # (colon-joined). Empty by default → single-root behavior, identical to
+  # before; the binary carries no distro-specific assumptions.
+  #
+  # Use this — together with `extraHostPathMounts` below — for any cluster whose
+  # gVisor `io.containerd.runsc.v1` shim keeps runsc state on a subtree the
+  # `containerd-run` mount does not cover, so the SAME image works across stock
+  # containerd, k3s, RKE2, etc. without rebuilding. Each entry is a path *inside
+  # the node container*; the node auto-selects whichever candidate holds the
+  # container at pause/resume time.
+  #
+  # Example (k3s/RKE2: the embedded-containerd *socket* is at
+  # /run/k3s/containerd — hostPathContainerdRun — but the gVisor shim writes
+  # runsc state to the stock /run/containerd/runsc; expose that host dir and
+  # list its in-container path here):
+  #   runscRootFallbacks:
+  #     - /run/host-runsc/runsc/k8s.io
+  #   extraHostPathMounts:
+  #     - name: host-runsc
+  #       hostPath: /run/containerd          # where the shim really writes
+  #       mountPath: /run/host-runsc         # must prefix a runscRootFallbacks entry
+  # Confirm the real host path on an affected node with:
+  #   find /run /var/lib -maxdepth 5 -name '<container-id>' -type d
+  runscRootFallbacks: []
+  # Containerd run/state root(s) the node SEARCHES to *discover* the runsc state
+  # root when neither `runscRoot` nor `runscRootFallbacks` holds the target
+  # container (issue #377). Surfaced to the binary as
+  # SANDBAWKS_RUNSC_ROOT_SEARCH_DIRS (colon-joined). Empty by default →
+  # discovery off, identical behavior to before.
+  #
+  # This is the PREFERRED, distro-agnostic alternative to enumerating exact
+  # `runscRootFallbacks`: instead of knowing your shim's precise
+  # `runsc/<namespace>` suffix, point this at the cluster's mounted containerd
+  # run/state root and the node recursively finds the `<root>/<container-id>`
+  # state dir wherever the gVisor shim placed it. The SAME image then works on
+  # stock containerd, k3s, RKE2, etc. with no per-distro path. Each entry is a
+  # path *inside the node container*; the matching host subtree must be mounted
+  # (via the `containerd-run` mount or `extraHostPathMounts`) for it to be
+  # visible. The walk is bounded in depth and only matches directories under a
+  # `runsc` path component, so it never selects containerd's identically-named
+  # task bundle.
+  #
+  # Example (k3s, VERIFIED on a node 2026-06-07): k3s relocates containerd's
+  # state dir to /run/k3s/containerd (CRI + task metadata live there), but the
+  # runc/runsc shims keep their OCI runtime root at the stock host
+  # /run/containerd. The gVisor shim writes runsc state as flat files at
+  # /run/containerd/runsc/k8s.io/<cid>_sandbox:<sandbox-id>.state (NOT a
+  # per-container subdir). That stock host dir is not covered by the
+  # `containerd-run` mount, so expose it and let the node discover the runsc root:
+  #   runscRootSearchDirs:
+  #     - /run/host-containerd
+  #   extraHostPathMounts:
+  #     - name: host-containerd
+  #       hostPath: /run/containerd          # stock containerd run root (NOT /run/k3s/containerd)
+  #       mountPath: /run/host-containerd    # a runscRootSearchDirs entry
+  runscRootSearchDirs: []
+  # Operator-defined extra hostPath mounts for the node container (issue #366),
+  # used to expose the runsc-state subtree(s) referenced by runscRootFallbacks.
+  # Each item: { name, hostPath, mountPath, readOnly?, type? } where `name`,
+  # `hostPath` and `mountPath` are REQUIRED — the template `required`-guards
+  # them, so an omitted field fails at `helm install` instead of producing a
+  # volume mounted at "" (which kubelet rejects with an opaque error). Mounted
+  # RW by default (resume's `runsc restore` writes back into the runsc root);
+  # `type` defaults to DirectoryOrCreate. Empty by default. See the example
+  # above; each `mountPath` should prefix a `runscRootFallbacks` entry.
+  extraHostPathMounts: []
+  # Pinned host runsc (gVisor) version (#545/#546). Single source of truth for
+  # the release the node REPORTS drift against (Node label
+  # `sandbawks.dev/runsc-version` + `runsc_version` info gauge) and, with
+  # `runscAutoReconcile`, CONVERGES the host binary to. MUST match the runsc
+  # release bundled in the node image (crates/sandbawks-node/Dockerfile
+  # `GVISOR_RELEASE`) and the host installer pin (scripts/install-runsc-k3s.sh
+  # `runsc_version`) — the #455 three-place lockstep; a mismatch makes the node
+  # refuse to converge rather than thrash. Accepts a bare version
+  # (`20260525.0`) or the full `release-20260525.0` token.
+  #
+  # MUST stay QUOTED — it is a `YYYYMMDD.N` string, not a number. Unquoted in a
+  # values file it is parsed as a YAML float and renders as `2.0260608e+07` in
+  # SANDBAWKS_RUNSC_VERSION, which never matches a `release-<ver>` token (the
+  # chart fails the render with a clear message if you do — see node-daemonset.yaml).
+  runscVersion: "20260525.0"
+  # Opt-in restart-free convergence (#546). When true, a node with NO live
+  # sandboxes whose host runsc differs from `runscVersion` has its
+  # /usr/local/bin/runsc + containerd-shim-runsc-v1 atomically replaced with the
+  # image-bundled pinned build — no k3s restart, no nsenter. Default false:
+  # version REPORTING and legacy-apt-channel cleanup always run (when
+  # runscReconcile.enabled); only the binary swap is gated. Convergence is
+  # deferred while the node hosts live sandboxes, because swapping the binary
+  # makes their current-version snapshots unrestorable on this node mid-rollout
+  # (composes with the #545 restore-placement gate).
+  runscAutoReconcile: false
+  runscReconcile:
+    # Master toggle for the runsc version reporter + apt-channel disarm + the
+    # two host mounts it needs. Default true. Set false to drop the host
+    # /usr/local/bin + /etc/apt/sources.list.d mounts entirely (the binary's
+    # reconciler then finds nothing and no-ops).
+    enabled: true
+    # Host dir holding the pinned runsc the installer drops (mounted RW at the
+    # fixed in-container /host/usr/local/bin). Stock layout is /usr/local/bin on
+    # every supported distro; only override for an unusual host PATH.
+    hostBinDir: /usr/local/bin
+    # Host gVisor apt source dir (mounted RW at /host/etc/apt/sources.list.d).
+    # The node removes `gvisor.list` from it to disarm the rolling channel.
+    aptSourceDir: /etc/apt/sources.list.d
+    # Optional host gVisor apt keyring to also remove. Empty (default) → keyring
+    # removal off and no extra mount, keeping the host write surface to the apt
+    # source dir + /usr/local/bin (the #546 acceptance scope). Removing the
+    # *source* alone already disarms the channel; set this (an in-container path,
+    # e.g. /host/usr/share/keyrings/gvisor-archive-keyring.gpg) AND mount the
+    # containing host dir via `extraHostPathMounts` to enable it.
+    aptKeyringPath: ""
+    # Reconcile interval, seconds. Surfaced as SANDBAWKS_RUNSC_RECONCILE_SECS.
+    # runsc drift is host-apt-timer-driven (at most daily), so 5 min keeps the
+    # version label fresh and re-disarms a re-added channel without churn.
+    intervalSeconds: 300
+
+  # Opt-in PRIVILEGED, restart-bearing in-place fleet upgrade (#550, Capability C
+  # of #545). When true, a node with NO live sandboxes that holds the cluster-wide
+  # one-at-a-time upgrade lease runs the FULL host installer
+  # (scripts/install-runsc-k3s.sh --runsc-version <runscVersion>) via `nsenter`
+  # into PID 1 + `systemd-run`, which REWRITES the containerd CRI handler tables
+  # and RESTARTS k3s — killing every sandbox on that node. This is the convergence
+  # path for when the handler tables (not just the binary) must change; for a
+  # plain binary bump use the restart-free `runscAutoReconcile` (#546) instead.
+  # Default false.
+  #
+  # Mutually exclusive with `runscAutoReconcile`: the chart fails to render if both
+  # are true (the restart-free swap would converge the binary first, so this
+  # restart-bearing path would never fire — enabling both is a misconfiguration).
+  # Requires `runscUpgrade.enabled` (the privileged surface) below.
+  runscAutoUpgrade: false
+  runscUpgrade:
+    # Master toggle for the privileged upgrader: the cluster-wide upgrade-Lease
+    # RBAC, the host installer-staging mount, and the upgrader loop. Default false
+    # — this is a host-root, k3s-restarting path; only enable it when you intend to
+    # drive in-place fleet upgrades. With it on but `runscAutoUpgrade` off, the loop
+    # only reports + releases a stale lease (no install).
+    enabled: false
+    # Name of the single cluster-wide coordination.k8s.io/v1 Lease that serializes
+    # the upgrade to ONE node at a time. Surfaced as
+    # SANDBAWKS_RUNSC_UPGRADE_LEASE_NAME.
+    leaseName: sandbawks-runsc-upgrade
+    # Upgrade-lease TTL, seconds. This is the MAX time the rollout stalls if a node
+    # bricks mid-upgrade (acquired the lease, restarted, never returned). Must
+    # comfortably exceed one installer run (a couple of k3s restarts + a crictl
+    # readiness poll). Surfaced as SANDBAWKS_RUNSC_UPGRADE_LEASE_DURATION_SECS.
+    leaseDurationSeconds: 600
+    # Upgrade-tick interval, seconds. Surfaced as SANDBAWKS_RUNSC_UPGRADE_SECS.
+    intervalSeconds: 300
+    # Host directory the node stages the bundled installer into and that the
+    # detached `systemd-run` then executes from on the host. Mounted RW at the
+    # fixed in-container /host/opt/sandbawks. Stock layout; override only for an
+    # unusual host. The DirectoryOrCreate mount creates the dir.
+    hostStagingDir: /opt/sandbawks
+  # In-flight chunk concurrency for snapshot upload/download
+  # (`SANDBAWKS_S3_PARALLELISM`). Empty → the binary default (8). The snapshot
+  # transfer is per-request-latency-bound against garage, so raising this
+  # scales throughput until the backend saturates; it also raises the node
+  # DaemonSet's peak RSS (~(2N+1)·4 MiB ≈ 68 MiB at 8, ≈ 260 MiB at 32), so
+  # keep it well under `resources.limits.memory`.
+  s3Parallelism: ""
+  # Per-chunk object size in MiB for snapshot transfer
+  # (`SANDBAWKS_S3_CHUNK_MIB`). Empty → the binary default (4). Each chunk is
+  # one S3 object, so larger chunks mean fewer PUT/GET requests — a win when
+  # the backend's per-object cost (metadata + fsync) dominates over bytes.
+  # Coarsens content-addressed dedup and raises peak RSS (~(2N+1)·chunk);
+  # mind the interaction with `s3Parallelism` under `resources.limits.memory`.
+  s3ChunkMib: ""
+  # Pause restorability validate level (`SANDBAWKS_S3_VALIDATE_LEVEL`, issue
+  # #235): off | head | sha | full. Empty → the binary default **head**
+  # (head+size: confirm each snapshot object exists and is the right size,
+  # without re-downloading or decompressing the bundle). The GiB bench showed
+  # the old `full` re-download+decompress was ~40% of a pause; `head` removes
+  # that. Raise to `sha` (adds byte-integrity) or `full` (adds decompress +
+  # *.img postcondition checks) where the stronger fail-closed guarantee is
+  # worth the extra pause latency.
+  snapshotValidateLevel: ""
+  hostPathSnapshotCache: /var/lib/sandbawks/snapshots
+  # Host path the node DaemonSet mounts for the *staging* root — where
+  # `GvisorAdapter::stage_snapshot` (Plan 07 T8) materializes a paused
+  # sandbox's snapshot bundle before the shim restores from it. This MUST
+  # be a hostPath (not the pod's ephemeral fs): the host-side
+  # `containerd-shim-sandbawks-v1` reads the path recorded in the restore
+  # Pod's `io.sandbawks/restore-image-path` annotation directly off the
+  # node filesystem, so the node worker and the shim have to see the same
+  # directory. Relocatable (issue #512): this one value drives the node
+  # DaemonSet's staging-cache mountPath AND hostPath, the node binary's
+  # `SANDBAWKS_STAGING_ROOT`, and the controller's
+  # `SANDBAWKS_RESTORE_STAGING_ROOT` annotation (all via the
+  # `sandbawks.stagingRoot` helper), so overriding it relocates all three at
+  # once. Must be an absolute path — the render fails fast otherwise.
+  hostPathStagingCache: /var/lib/sandbawks/staging
+  # Host path the `stage-envd` init container writes the static envd
+  # binary to, and that every sandbox Pod mounts read-only to exec it as
+  # its entrypoint (issue #265 — so customers never bundle envd). MUST
+  # match the controller's `ENVD_STAGE_HOSTPATH`
+  # (crates/sandbawks-controller/src/pod_adapter.rs).
+  #
+  # WARNING (#272): this MUST be storage that survives a node reboot. The
+  # node advertises readiness via the `sandbawks.dev/envd-staged` Node
+  # label, which lives in etcd and persists across reboots; if you point
+  # this at ephemeral storage (tmpfs, a scratch/instance-store disk) the
+  # binary vanishes on reboot while the label lingers, sandbox Pods
+  # schedule onto the node, mount an empty dir, and CrashLoop — i.e. #272
+  # returns. The default below is node-local persistent storage; only
+  # override it with another persistent path.
+  hostPathEnvd: /var/lib/sandbawks/envd
+  # Fail-closed resource-headroom guard (issue #238). Before the node
+  # stages a snapshot bundle to disk — or restores one into memory — it
+  # refuses any bundle that would consume more than `headroomFraction` of
+  # the staging filesystem's available disk (and, on the in-process
+  # restore path, of available memory), or that would leave less than
+  # `headroomMinFreeBytes` free. Surfaced to the binary as
+  # SANDBAWKS_HEADROOM_FRACTION / SANDBAWKS_HEADROOM_MIN_FREE_BYTES.
+  # Defaulted conservatively; raise the fraction toward 1.0 to pack
+  # snapshots more aggressively.
+  headroomFraction: 0.8
+  headroomMinFreeBytes: 1073741824   # 1 GiB
+
+  # Host-side memory-pressure reaction (issue #307). gVisor sandbox limits are
+  # only enforced host-side (the in-sandbox cgroupfs is cosmetic, #306), and
+  # after #448 the sandbox nests under the kubelet's limited pod cgroup. When
+  # enabled, the node watches each sandbox's pod cgroup
+  # (memory.current/max/events) and, when one crosses `highWaterFraction` of its
+  # memory limit, emits a metric + warning and captures the sandbox's envd
+  # `/__state` to the snapshot S3 bucket before the kernel OOM-kills it.
+  #
+  # Off by default: it mounts the host `/sys/fs/cgroup` read-only and adds a
+  # per-node poll. Surfaced to the binary as SANDBAWKS_MEMORY_PRESSURE_*.
+  #
+  # Resolves both kubelet cgroup-driver layouts (systemd `kubepods.slice/...`
+  # and cgroupfs `kubepods/...`). If sandbox pods are present but none resolve
+  # to a cgroup, the node logs a one-shot diagnostic rather than silently
+  # reporting `memory_pressure.node_max_fraction = 0`.
+  memoryPressure:
+    enabled: false
+    # Host cgroup-v2 root, bind-mounted read-only at the same in-container path.
+    cgroupRoot: /sys/fs/cgroup
+    # Fire when memory.current reaches this fraction of memory.max (0.0, 1.0].
+    highWaterFraction: 0.9
+    # Poll interval, seconds.
+    intervalSeconds: 5
+
+  # Per-sandbox resource-pressure telemetry (epic #472): threshold-triggered
+  # logs + continuous OTel gauges (cpu/mem/disk/io/net) from the node daemonset,
+  # for debugging why a sandbox lags or fails. Off by default — it is a
+  # debugging aid, not an always-on subsystem; enabling it rolls the daemonset.
+  # The daemonset already runs with hostPID, so the host /proc (for per-sandbox
+  # network counters) is visible at /proc with no extra mount; it shares the
+  # read-only host cgroup mount with memoryPressure (their cgroupRoot must match
+  # when both are enabled).
+  sandboxPressure:
+    enabled: false
+    # Host cgroup-v2 root, bind-mounted read-only at mountPath == hostPath.
+    cgroupRoot: /sys/fs/cgroup
+    # Host /proc root for per-sandbox network counters (hostPID makes it visible).
+    procRoot: /proc
+    # Sample interval, milliseconds.
+    checkIntervalMs: 1000
+    # How often a line is emitted while a sandbox is under pressure, milliseconds
+    # (clamped up to checkIntervalMs). Raise it well above checkIntervalMs to
+    # sample frequently but log less often.
+    reportIntervalMs: 1000
+    # Full upperdir-walk cadence (seconds) that re-baselines the disk-fill
+    # estimate; between walks fill is estimated from io.stat write bytes.
+    walkIntervalSeconds: 15
+    # Warn thresholds — usage fractions (0.0, 1.0].
+    cpuWarnFraction: 0.85
+    memWarnFraction: 0.85
+    diskWarnFraction: 0.80
+    # PSI some-avg10 warn level, percent (0.0, 100.0].
+    psiWarnPercent: 25
+    # A signal clears at warn * clearRatio; (0.0, 1.0). Hysteresis avoids flapping.
+    clearRatio: 0.7
+
+# Default envd-rs sidecar image for SandboxTemplates that don't set
+# `.spec.envdImage` explicitly. Rendered into the controller Deployment
+# as `SANDBAWKS_DEFAULT_ENVD_IMAGE=<image>:<tag>` (see
+# controller-deployment.yaml); Plan 05 wires the controller to actually
+# consume it when materializing Sandboxes into Pods. With node-staged envd
+# delivery this cluster-wide value is authoritative: per-template
+# `SandboxTemplate.spec.envdImage` is no longer consumed on cold-start or
+# restore and is a no-op (issue #265/#273).
+#
+# Bumped by Plan 03 T11 — see issue #53.
+#
+# RESTORE DETERMINISM (issue #270): this is the cluster-wide envd binary
+# the `sandbawks-node` DaemonSet stages onto every node and that every
+# sandbox execs. A paused sandbox's mmap'd code pages are backed by this
+# binary, so a memory `runsc restore` requires the restore node to stage a
+# byte-identical envd. If the staged binary drifts between a sandbox's
+# pause and resume, the controller fails the restore closed (it records
+# the binary's sha256 in the snapshot manifest and re-checks it at restore
+# time) — so a moving image turns "resume" into "fail and retry", never
+# silent corruption, but it also means in-flight paused sandboxes can't
+# resume across an envd bump. Prefer immutability.
+#
+# Two ways to reference the image, strongest first:
+#   1. Digest pin (registry-ENFORCED immutability) — the only mechanism a
+#      registry actually guarantees won't change under you:
+#        image: ghcr.io/hypotheosis/envd@sha256:<digest>
+#        tag:   ""   # ignored when the image carries a digest
+#   2. A release tag (`0.1.29`, published by kind-smoke.yaml's
+#      build-images job when `v0.1.29` is tagged). This is
+#      immutable only by PUBLISHER CONVENTION — nothing stops someone
+#      re-pushing that tag — so it is weaker than a digest pin. Acceptable
+#      because the worst case is bounded to a fail-closed retry, but if you
+#      want a hard guarantee, use form (1).
+envd:
+  image: ghcr.io/hypotheosis/envd
+  tag: "0.1.29"   # publisher-convention release tag; digest pin is stronger (issue #270)
+  pullPolicy: IfNotPresent
+
+# gVisor runtime configuration. When `enabled`, the chart renders the
+# cluster-scoped `RuntimeClass: gvisor` resource (handler `runsc`) that
+# the controller stamps onto sandbox Pods via `spec.runtimeClassName`.
+# Disable on clusters where runsc isn't installed on every node.
+#
+# IMPORTANT (#417): the `RuntimeClass` resource only tells the scheduler
+# which runtime to *request* — it does NOT install runsc. Before setting
+# `enabled: true`, every node that may host a sandbox must have `runsc` +
+# `containerd-shim-runsc-v1` installed and the `io.containerd.runsc.v1`
+# handler registered in containerd's config. `ci/kind-node/Dockerfile`
+# (with `ci/kind-node/containerd-runsc.toml`) is the authoritative recipe.
+# You don't have to gate on this by hand: the `sandbawks-node` DaemonSet
+# checks each node's kubelet-reported `status.runtimeHandlers` and withholds
+# the `sandbawks.dev/envd-staged` scheduling label on nodes where the gVisor
+# handler is absent, so sandbox Pods are never scheduled there rather than
+# looping on `FailedCreatePodSandBox: no runtime for "runsc" is configured`.
+# A node is re-admitted automatically once it reports the handler.
+gvisor:
+  enabled: true
+
+# sandbawks-runsc runtime configuration. When `enabled`, the chart renders
+# the cluster-scoped `RuntimeClass: sandbawks-runsc` resource (handler
+# `sandbawks-runsc`) backed by the containerd-shim-sandbawks-v1 shim
+# (Plan 07). The controller stamps it onto sandbox Pods that opt into
+# filesystem snapshot/restore via `spec.runtimeClassName`. Additive to the
+# `gvisor` RuntimeClass above; disable on clusters where the shim isn't
+# installed on every node.
+sandbawksRunsc:
+  enabled: true
+
+# Object store for snapshots. Endpoint left blank by default so a fresh
+# `helm install` doesn't try to talk to a real bucket.
+snapshotStore:
+  # Backend selector: "s3" (default; AWS/MinIO/garage via the endpoint/bucket/
+  # region keys below) or "azure" (Azure Blob Storage via the azure block).
+  # Read by both the node DaemonSet and the controller.
+  provider: s3
+
+  # ---- S3 / S3-compatible (provider: s3) ----
+  endpoint: ""
+  bucket: sandbawks-snapshots
+  region: us-east-1
+  # Point at a pre-existing Secret (containing `SANDBAWKS_S3_ACCESS_KEY`
+  # and `SANDBAWKS_S3_SECRET_KEY` keys) to disable the chart-managed
+  # auto-generated secret. Leaving this blank lets the chart render
+  # `snapshot-store-secret.yaml`, which generates random credentials on
+  # first install and preserves them across upgrades via the
+  # `helm.sh/resource-policy: keep` annotation. Production deployments
+  # should pin this to an externally-managed Secret.
+  existingSecret: ""
+
+  # ---- Azure Blob Storage (provider: azure) ----
+  azure:
+    # Storage account name.
+    accountName: ""
+    # Account access key (a SECRET). Supply at install time via
+    # `--set-string snapshotStore.azure.accountKey=...` or point
+    # `existingSecret` at a pre-made Secret. NEVER commit a real value here.
+    accountKey: ""
+    # Blob container holding the snapshot keyspace.
+    container: sandbawks-snapshots
+    # Optional: override the blob endpoint for Azurite / sovereign clouds,
+    # e.g. http://azurite:10000/devstoreaccount1. Empty -> public Azure.
+    endpoint: ""
+    # Point at a pre-existing Secret containing SANDBAWKS_AZURE_ACCOUNT_KEY to
+    # disable the chart-managed secret branch. Blank -> the chart renders the
+    # account-key Secret from `accountKey` above.
+    existingSecret: ""
+  # Snapshot retention GC (issue #186, Plan 06 T4). The controller runs
+  # a ticker that LISTs the bucket and DELETEs objects older than the
+  # effective retention window. Resolution order at GC time:
+  #   1. `Sandbox.spec.snapshotRetention` (CRD field).
+  #   2. Per-namespace annotation `sandbawks.dev/snapshot-retention`.
+  #   3. `defaultDuration` below (chart-wide fallback).
+  retention:
+    # Master kill-switch. `false` means the controller skips the
+    # retention ticker entirely — snapshot objects accumulate until
+    # the operator opts in. Once the per-namespace S3 prefix layout
+    # follow-up lands, flipping this to `true` is safe by default.
+    enabled: false
+    # Chart-wide default retention window when the Sandbox / namespace
+    # don't specify one. ISO-8601 duration: `P7D` (7 days), `PT24H`
+    # (24h), `PT30M` (30 minutes), `P1DT12H` (1.5 days).
+    defaultDuration: P7D
+    # How often the controller runs a sweep. ISO-8601 duration.
+    scanInterval: PT1H
+
+# Per-API-key usage metering for SaaS billing (epic #480). Both layers reuse the
+# `snapshotStore` S3 connection above (same bucket, distinct key prefixes) and are
+# OFF by default — turning either on injects the snapshot-store credentials into
+# the controller automatically (no separate bucket config). OTel is deliberately
+# NOT the billing source; these events/records are the authoritative ledger.
+# S3-compatible object stores only today (Azure usage sink is a follow-up).
+usage:
+  # Phase 2 (issue #631): the reconcile loop writes one authoritative NDJSON usage
+  # event per closed `Running` interval (resource-weighted seconds, per team+key).
+  metering:
+    enabled: false
+  # Phase 3 (issue #632): a periodic rollup reads those events and writes
+  # idempotent per-(team, key, hour) UsageRecords — the durable, invoice-safe
+  # ledger. Enable `metering` too, or the rollup has nothing to read.
+  rollup:
+    enabled: false
+    # How often the rollup runs. ISO-8601 duration. Hourly granularity (answer 3
+    # of #480) is in the bucketing, not this cadence — running more often just
+    # re-derives closed hours sooner (idempotent, so safe).
+    interval: PT1H
+  # Object-store key prefixes (under the snapshotStore bucket). Events are read
+  # from `eventPrefix`; rolled records are written under `ledgerPrefix`.
+  eventPrefix: usage
+  ledgerPrefix: ledger
+  # Durable spill + replay (issue #636). When a usage event fails emission after its
+  # bounded retry (a sustained object-store outage), the controller parks it on a
+  # PVC instead of dropping it, and a drainer replays it on recovery. OFF by default;
+  # enable alongside `metering` for outage-resilient billing. Without this, a
+  # multi-minute outage drops the intervals that close during it (observable via the
+  # `controller.usage.events_total{outcome="dropped"}` metric).
+  spill:
+    enabled: false
+    # PVC mount path inside the controller container (also SANDBAWKS_USAGE_SPILL_DIR).
+    mountPath: /var/lib/sandbawks/usage-spill
+    # Spill PVC size. One small NDJSON file per parked interval; even a long outage
+    # over a large fleet stays well under this.
+    size: 1Gi
+    # Storage class for the spill PVC. Empty = cluster default. For HA
+    # (controller.replicas > 1) this MUST resolve to a ReadWriteMany-capable class
+    # and `accessModes` must include ReadWriteMany (see below).
+    storageClassName: ""
+    # Access modes. ReadWriteOnce suits the default single-replica controller; switch
+    # to [ReadWriteMany] for a multi-replica (HA) controller so standby replicas can
+    # mount the shared volume (only the leader writes/drains).
+    accessModes:
+      - ReadWriteOnce
+    # How often the drainer replays parked events. ISO-8601 duration.
+    drainInterval: PT1M
+
+# OpenTelemetry / observability for ALL sandbawks server workloads — the api
+# Deployment, the controller Deployment, and the node DaemonSet (issue
+# #294/#295, Phase 7). The fourth traced service, `envd`, runs inside each
+# sandbox Pod and is configured by the controller, not this block.
+#
+# When `enabled`, every workload exports OTLP (logs, metrics, traces) to
+# `endpoint` and shares one `trace_id` across a request. When DISABLED (the
+# default), the chart sets `OTEL_SDK_DISABLED=true` on every workload so each
+# binary short-circuits to fmt-only stderr logging and never attempts an
+# export — otherwise the SDK silently retries the default `localhost:4318`
+# and floods warnings. The wiring is emitted by the shared
+# `sandbawks.observabilityEnv` helper (templates/_helpers.tpl).
+#
+# See docs/observability.md for the operator-facing walkthrough, the local
+# collector fixture (deploy/kind/fixtures/otel-collector.yaml), and the
+# single-`trace_id` validation check.
+#
+# PLAINTEXT-ONLY (Phase 1): the binary is built without an OTLP TLS feature
+# (enabling reqwest's rustls collides with kube's ring CryptoProvider and
+# panics `Client::try_default()` — see crates/sandbawks-observability docs).
+# So `endpoint` MUST be a plaintext (http://, or grpc:// without TLS) target:
+#   - recommended: an in-cluster OTel Collector that terminates TLS and
+#     forwards to Traceway with the vendor token (token stays on the
+#     collector, never in the app):
+#       endpoint: http://otel-collector.observability.svc:4318
+#   - acceptable: Traceway's own in-cluster plaintext OTLP intake:
+#       endpoint: http://traceway-collector.traceway.svc:4318
+# A TLS Traceway ingress host is NOT reachable directly until the
+# deployment-phase TLS work lands (#294 Phases 4-7); route via a collector.
+observability:
+  enabled: false
+  # OTLP base URL. SDK appends /v1/{traces,metrics,logs} for http/protobuf.
+  endpoint: ""
+  # Wire protocol: `http/protobuf` (default) or `grpc`.
+  protocol: http/protobuf
+  # Sampling strategy + ratio (ratio used only by *_traceidratio strategies).
+  sampler: parentbased_always_on
+  samplerArg: "1.0"
+  # Extra resource attributes, comma-separated key=value (e.g.
+  # "deployment.environment=prod,service.namespace=sandbawks"). The binary
+  # already sets service.name / service.version / service.instance.id.
+  resourceAttributes: ""
+  # Per-export timeout in milliseconds. Blank leaves the SDK default (~10s).
+  # Keep it generous: the first export races kube-client startup at boot.
+  timeoutMs: ""
+  # GenAI content capture (issue #426). When true, each sandbox's envd records
+  # the (redacted) command line of the agentic commands clients run as the
+  # `gen_ai.tool.call.arguments` attribute on its `execute_tool` spans; the
+  # controller forwards this flag into envd via FORWARDED_OTEL_VARS. PRIVACY:
+  # this puts best-effort-redacted command lines into your traces — the redactor
+  # masks known secret shapes (KEY=VALUE pairs, provider-token prefixes, JWTs,
+  # high-entropy blobs) but is a denylist, not a guarantee, and the sandbox is
+  # customer-controlled. Environment-variable *values* are never recorded.
+  # Leave off unless you accept command lines in your telemetry. Defaults off.
+  captureGenaiContent: false
+  # Optional OTLP auth headers (comma-separated key=value), e.g. a vendor
+  # bearer token when exporting STRAIGHT to Traceway rather than via a
+  # plaintext collector. With the recommended collector hop you leave both
+  # blank (the collector holds the token). Two ways to supply them:
+  #   1. existingHeadersSecret — name of a Secret with an `otlp-headers`
+  #      key. Preferred: keeps the token out of values.yaml and the
+  #      rendered release.
+  #   2. headers — inline string. Convenient but lands in the rendered
+  #      manifest and Helm release history; do not use for real secrets.
+  existingHeadersSecret: ""
+  headers: ""
+  # In-namespace telemetry hop (issues #421 / #496). When enabled, the chart
+  # deploys a `timberio/vector` (Vector) Deployment + Service into the release
+  # namespace that RECEIVES plaintext OTLP from every workload — the
+  # api/controller/node AND each sandbox's envd — and FORWARDS to the
+  # downstream APM (Traceway) with a bearer token held only on the hop. Vector
+  # replaced the OpenTelemetry Collector contrib distro in #496; the OTLP
+  # receiver ports, the Secret contract, and the credential-isolation property
+  # are unchanged, and Vector can additionally re-expose the received metrics on
+  # a Prometheus scrape endpoint (see `prometheus` below).
+  # This is the topology the block above recommends; it also fixes envd, which
+  # is deliberately never handed the credential (the controller strips
+  # OTEL_EXPORTER_OTLP_HEADERS from customer-controlled sandbox Pods) and so
+  # 401s when pointed straight at Traceway's authenticated intake.
+  #
+  # With the collector enabled, leave `observability.endpoint` blank: every
+  # workload defaults to `http://sandbawks-otel-collector.<namespace>.svc:4318`,
+  # and `headers`/`existingHeadersSecret` above MUST stay blank (the token now
+  # lives on the collector, not in the app processes).
+  #
+  # REACHABILITY: the collector Service is reachable on :4317/:4318 from every
+  # Pod in the release namespace, INCLUDING customer-controlled sandbox Pods —
+  # intentional (envd must reach it), but it also accepts OTLP from anything
+  # else scheduled here. A `resource` processor pins tenant identity on the way
+  # out (see the collector pipeline); a NetworkPolicy restricting ingress to
+  # sandbawks-managed + sandbox Pods is the structural lock-down (follow-up).
+  collector:
+    enabled: false
+    image:
+      # Pinned Vector build pulled through the dockerio proxy (drops the
+      # `library/` infix; non-library images keep their full path). The `otlp`
+      # encoding codec the traceway sinks use is available since Vector 0.51.0.
+      repository: docker.io/timberio/vector
+      tag: "0.56.0-debian"
+      pullPolicy: IfNotPresent
+    replicas: 1
+    # Vector's own log verbosity (the VECTOR_LOG env / `--log-level`). Not wired
+    # into the rendered config; set via the image if you need to override.
+    logLevel: info
+    # Per-sink bounded in-memory buffer size (events) for the Traceway forwarding
+    # sinks. Vector has no `memory_limiter` equivalent to the old OTel Collector,
+    # so this is the OOM guard: once a sink's buffer fills (e.g. Traceway
+    # unreachable) the newest events are dropped (`when_full: drop_newest`)
+    # rather than blocking the OTLP source or growing into the memory limit.
+    # Three sinks (traces/metrics/logs), so peak buffer memory is ~3x this many
+    # events. Raise it to lose fewer events across short Traceway blips at the
+    # cost of headroom under `resources.limits.memory`.
+    bufferMaxEvents: 1000
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: "1"
+        memory: 256Mi
+    # Downstream APM the collector forwards to.
+    exporter:
+      # OTLP/HTTP base URL of the APM intake; the collector appends
+      # /v1/{traces,metrics,logs}. For Traceway:
+      #   http://traceway.traceway.svc.cluster.local/api/otel
+      endpoint: ""
+      # Bearer token the collector authenticates to the APM with. Supply ONE:
+      #   1. existingTokenSecret — name of a Secret with a `token` key.
+      #      Preferred: keeps the token out of values.yaml and release history.
+      #   2. token — inline value. Convenient but lands in the rendered release;
+      #      dev only.
+      # Required when the collector is enabled and existingTokenSecret is blank
+      # (the APM rejects unauthenticated exports).
+      existingTokenSecret: ""
+      token: ""
+    # Prometheus scrape endpoint (#496 Phase 2). When enabled, Vector's
+    # prometheus_exporter sink re-exposes the metric series it receives over
+    # OTLP at `:<port>/metrics`, so a Prometheus deployment can PULL the same
+    # metrics that are also pushed to Traceway. Surfaced as a new Service port
+    # plus `prometheus.io/scrape` Pod annotations; prometheus-operator users can
+    # point a ServiceMonitor at the `prometheus` Service port instead (see
+    # docs/observability.md). Standing up Prometheus itself is out of scope —
+    # this only exposes the scrape surface. Disabled by default (nothing changes
+    # out of the box).
+    prometheus:
+      enabled: false
+      # Listen port for the scrape endpoint (conventionally 9090). Exposed on the
+      # Pod, the Service, and the NetworkPolicy ingress when enabled.
+      port: 9090
+    # Pipeline split (issue #424). NOT yet ported to the Vector hop — enabling
+    # this (or k8sattributes below) makes the chart fail to render until #496
+    # Phase 3 lands the Vector equivalent. Kept here so the values contract is
+    # stable across the swap. When enabled, sandbox envd signals arrive on
+    # the sandbox pipeline (gRPC :4317 / HTTP :4318) where stricter scrubbing is
+    # applied; internal workloads (api, controller, node) use the internal
+    # pipeline (gRPC :4319 / HTTP :4320). The controller emits a
+    # `SANDBAWKS_OTEL_SANDBOX_ENDPOINT` env var so pod_adapter redirects sandbox
+    # envd to the sandbox receiver instead of inheriting the controller's
+    # internal endpoint. Disabled by default; enable once both sets of receiver
+    # ports are exposed by the collector Service.
+    splitPipelines:
+      enabled: false
+      # Prefix prepended to `service.name` on every sandbox signal by the
+      # `transform/sandbox_service_name` processor. Prevents a sandbox from
+      # setting `service.name=sandbawks-api` and polluting internal dashboards.
+      sandboxServiceNamePrefix: "sandbox/"
+    # k8sattributes processor (issue #424). When enabled, the collector stamps
+    # `k8s.pod.name`, `k8s.pod.uid`, and `k8s.namespace.name` on sandbox
+    # signals from a trusted source (the Kubernetes API, keyed on the sending
+    # Pod's source IP) rather than trusting client-supplied resource attributes.
+    # Requires RBAC to GET/LIST/WATCH pods — rendered in
+    # otel-collector-rbac.yaml when enabled, and the collector Deployment gains
+    # a dedicated ServiceAccount. Has no effect unless splitPipelines.enabled.
+    #
+    # Assumption: pod identity is keyed on the sender's source IP
+    # (`pod_association: from: connection`). This holds for the documented
+    # topology (envd -> collector ClusterIP, which preserves source IP). If
+    # anything re-NATs between sandbox and collector — a service-mesh sidecar,
+    # an egress gateway, or an Ingress fronting the collector — every sandbox
+    # signal is attributed to the proxy Pod instead. Keep the path direct, or
+    # the stamped k8s.pod.* attributes become meaningless.
+    k8sattributes:
+      enabled: false
+    # NetworkPolicy restricting collector Service ingress to sandbawks Pods
+    # (issue #424). When enabled together with splitPipelines:
+    #   - ports 4317/4318 (sandbox pipeline): only sandbox Pods
+    #     (app.kubernetes.io/name=sandbawks-sandbox) may connect.
+    #   - ports 4319/4320 (internal pipeline): only api/controller/node Pods
+    #     (app.kubernetes.io/name=sandbawks) may connect.
+    # Without splitPipelines both sets of Pods may reach 4317/4318.
+    # Port 13133 (health) is left unrestricted so kubelet probes succeed.
+    networkPolicy:
+      enabled: false
+
+# Install CRDs as part of the chart. Set to false if CRDs are managed
+# separately (e.g. ArgoCD's CRD sync).
+installCrds: true

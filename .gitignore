@@ -1,0 +1,44 @@
+**/.worktrees
+/target
+
+# hegel (hegeltest) caches the test server binary, downloaded Unicode
+# data, and per-run logs under .hegel/ at the repo root and at each
+# crate root that runs hegel tests. None of it is source.
+.hegel/
+
+# Python harness (tests/e2b-sdk-compat) — uv-managed virtualenv,
+# uv cache, pytest cache, and the lockfile content_hash dir. The
+# harness lives outside the Cargo workspace; see its README.
+tests/e2b-sdk-compat/.venv/
+tests/e2b-sdk-compat/.uv/
+tests/e2b-sdk-compat/.pytest_cache/
+tests/e2b-sdk-compat/**/__pycache__/
+
+# JS harness (tests/e2b-sdk-compat-js, Plan 06 T5, issue #187) —
+# npm-managed node_modules and any locally produced junit XML.
+# `package-lock.json` is checked in so CI builds against a pinned
+# tree; everything else is build/run output.
+tests/e2b-sdk-compat-js/node_modules/
+tests/e2b-sdk-compat-js/*.xml
+
+# Go shim subtree (shim/, Plan 07 T1, issue #205). If we ever switch the
+# shim to vendored dependencies (`go mod vendor`), the vendor tree is build
+# input reproducible from go.mod/go.sum and should not be checked in. The
+# shim's own go.mod/go.sum and source are versioned; its build output lands
+# under the shared /target (already ignored above).
+shim/vendor/
+
+# Sibling Cargo project under tests/bench/ (Plan 06 T3, issue #185)
+# has its own target/ at that path because its standalone `[workspace]`
+# manifest puts cargo build output there rather than under the
+# workspace root's /target. Source (Cargo.toml, Cargo.lock, src/) is
+# checked in; build output is not.
+tests/bench/target/
+shim/containerd-shim-sandbawks-v1
+.fastembed_cache/
+
+# claims-mcp sidecar lock file (the ledger itself, claims.json, is tracked)
+.claims.json.lock
+
+# Local secrets (.claude/CLAUDE.md Security: secrets live only in .env)
+.env

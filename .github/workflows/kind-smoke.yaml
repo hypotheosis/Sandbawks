@@ -1,0 +1,1581 @@
+name: build + cluster tests
+
+# Unified CI gate for the workspace images, the controller's end-to-end
+# reconcile loop against a real Kubernetes apiserver (issue #134), and the
+# pause/resume perf bench (issue #185), sharing one image build:
+#
+#   1. `build-images` — strategy matrix over [controller, api, envd, node].
+#      Each leg builds its Dockerfile with a per-image GitHub Actions cache
+#      scope and pushes commit-scoped tags to ghcr.io. Runs on every
+#      same-repo PR that touches image inputs and every push to `main` /
+#      `v*` tag. `fail-fast: false` so one bad image doesn't cancel the
+#      others.
+#   2. `kind-smoke` — `needs: build-images`. Pulls the same commit tag,
+#      `kind load`s it into a two-node gVisor kind cluster, and runs the
+#      chart / api / pause-resume / warm-pool / OTel / SDK smokes, each
+#      behind an env toggle.
+#   3. `bench` — also `needs: build-images`, opt-in via the `benchmark`
+#      label. Runs on its own kind cluster and reports per-iteration
+#      latency + snapshot bundle bytes in `bench-results.json`; fails the
+#      workflow on a p95 latency or workload-floor breach.
+#
+# Tag scheme (issue #134):
+#   - Always:        `:sha-<full-github-sha>`   (commit-scoped, what the
+#                                                smoke / bench jobs pull)
+#   - PR events:     `:pr-<pr-number>`          (moving — always latest
+#                                                commit on that PR)
+#   - Push to main:  `:latest`
+#   - Tag push:      `<semver>`                  (e.g. `1.2.3`)
+#
+# Fork PR handling: fork PRs get a read-only token, so the build job runs
+# without pushing (the Dockerfiles are still exercised) and the downstream
+# cluster jobs are skipped.
+#
+# The cluster jobs run directly on the hosted runner VM: Docker is local, so
+# kind's default loopback kubeconfig works as-is, and each run gets a fresh
+# VM, so no cross-run cleanup is needed. Tool pins live in
+# .github/actions/setup-cluster-tools.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+# `packages: write` pushes images to ghcr.io; `pull-requests`/`issues: write`
+# let the ci/*-pr-comment.mjs reporters upsert their PR comments.
+permissions:
+  contents: read
+  packages: write
+  pull-requests: write
+  issues: write
+
+# Cancel any in-flight run of this workflow when a new commit lands on
+# the same ref. Saves runner time on rapid PR iteration. The bench leg
+# previously had this gate inline; folding it up here means the smoke
+# leg gets the same benefit (PR #192 review flagged the gap).
+concurrency:
+  group: cluster-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fail-fast gate: skip the (expensive) image builds, kind-smoke, and bench on
+  # any PR whose branch is behind `main`, since those results are invalidated
+  # the moment the branch is brought current (#501). `build-images` `needs:` it,
+  # and kind-smoke / bench already `needs: build-images`, so one failed gate
+  # cascade-skips the whole workflow before a single image is built. Shares the
+  # same local composite action as ci.yml so the detection logic has one home.
+  # `fetch-depth: 0` — see the action's own docs (`--is-ancestor` needs history).
+  branch-up-to-date:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/branch-up-to-date
+
+  # Path-filter gate for the expensive image build + cluster jobs (#571).
+  # Before this, kind-smoke.yaml built five images and ran the smoke / bench
+  # suites on EVERY pull_request regardless of what the PR touched, so a docs-
+  # or chart-only PR paid the full multi-image BuildKit + kind-cluster cost for
+  # nothing. This job mirrors ci.yml's `detect-changes` (same
+  # dorny/paths-filter@v3 tool, same taxonomy) and emits a single `images`
+  # output that is true only when a file that can change image *contents* or
+  # *runtime* behavior is touched: the Rust compilation inputs, the per-crate
+  # Dockerfiles, the Go shim, the runsc-baked kind-node image inputs, and this
+  # workflow file itself.
+  #
+  # The helm chart is deliberately NOT in this list. A chart change cannot
+  # alter image contents, and #571's acceptance criteria require a chart-only
+  # PR to skip the image build / smoke / bench — its coverage already lives in
+  # ci.yml's helm lint / template / version-bump jobs. (The issue's prose
+  # mentions the chart as a trigger, but the acceptance criteria, which are the
+  # contract, say the opposite; the criteria win.)
+  #
+  # Runs always (gated only behind branch-up-to-date, ~5s). The heavy jobs
+  # `needs:` it, so a PR that doesn't touch image inputs cascade-skips them and
+  # the skip reports as success — not a stuck-pending required check (the same
+  # pattern ci.yml uses for its rust/go/scripts gates).
+  detect-changes:
+    needs: branch-up-to-date
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.filter.outputs.images }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            images:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - '**/*.proto'
+              - 'rust-toolchain*'
+              - '.cargo/**'
+              - 'deploy/crds/**'
+              - 'crates/*/Dockerfile'
+              - 'shim/**'
+              - 'ci/kind-node/**'
+              - '.github/workflows/kind-smoke.yaml'
+
+  build-images:
+    needs: [branch-up-to-date, detect-changes]
+    # Skip the multi-image build on pull requests that don't touch image
+    # inputs (#571). Non-PR events (push to main, tag pushes) always build so
+    # the :latest / semver tags stay current. The `benchmark` label also
+    # forces a build even on a docs-only PR, because the bench job below
+    # `needs:` these freshly-built `sha-<sha>` images.
+    if: >-
+      github.event_name != 'pull_request'
+      || needs.detect-changes.outputs.images == 'true'
+      || contains(github.event.pull_request.labels.*.name, 'benchmark')
+    runs-on: ubuntu-latest
+    # Cold builds compile the whole workspace on a 2-4 vCPU runner; warm
+    # builds reuse the cargo-chef dependency layer from the GHA cache.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: controller
+            repo: ghcr.io/hypotheosis/sandbawks-controller
+            dockerfile: crates/sandbawks-controller/Dockerfile
+          - image: api
+            repo: ghcr.io/hypotheosis/sandbawks-api
+            dockerfile: crates/sandbawks-api/Dockerfile
+          - image: envd
+            repo: ghcr.io/hypotheosis/envd
+            dockerfile: crates/envd/Dockerfile
+          - image: node
+            repo: ghcr.io/hypotheosis/sandbawks-node
+            dockerfile: crates/sandbawks-node/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      # Fork-PR detection: a fork PR's token cannot push packages, so build
+      # without pushing (still verifies the Dockerfile); the downstream
+      # cluster jobs gate on the same predicate.
+      - id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          IS_FORK="false"
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$HEAD_REPO" != "$THIS_REPO" ]; then
+              IS_FORK="true"
+              echo "::warning::Fork PR detected — building without push; cluster jobs will be skipped." >&2
+          fi
+          echo "is_fork=${IS_FORK}" >> "$GITHUB_OUTPUT"
+      - if: steps.scope.outputs.is_fork != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Tag plan (see header):
+      #   - `sha-<full-sha>` is the always-present, commit-scoped tag the
+      #     cluster jobs pull, so re-running just a cluster job is a
+      #     `docker pull` + `kind load` away (no rebuild).
+      #   - `pr-<n>` is a moving tag on PR events only.
+      #   - `latest` / semver on main and version tags.
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ matrix.repo }}
+          tags: |
+            type=raw,value=sha-${{ github.sha }}
+            type=raw,value=pr-${{ github.event.pull_request.number }},enable=${{ github.event_name == 'pull_request' }}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+      # The Dockerfiles' default `BUILDER_IMAGE` (rust:*-bookworm) installs
+      # cargo-chef + sccache in the chef stage. No SCCACHE_BUCKET is passed,
+      # so sccache uses its local disk cache; the cross-run win comes from the
+      # GHA layer cache (`mode=max` keeps the cargo-chef dependency layer).
+      - name: Build (and push if not a fork PR)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: ${{ steps.scope.outputs.is_fork != 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+
+  kind-smoke:
+    needs: [build-images, detect-changes]
+    # Skip on fork PRs — build-images doesn't push, so there's nothing
+    # to pull. Same predicate the build job's `is_fork`
+    # check evaluates; kept inline here so the smoke job's gating is
+    # readable on its own. The `detect-changes` clause (#571) additionally
+    # skips the smoke run on a same-repo PR that doesn't touch image inputs;
+    # if build-images itself was skipped this job cascade-skips anyway, but the
+    # explicit `images` check keeps the gating self-documenting and also skips
+    # smoke on a benchmark-labelled docs-only PR (where build-images runs for
+    # the bench but there is no code change to smoke-test).
+    if: >-
+      github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && needs.detect-changes.outputs.images == 'true'
+    runs-on: ubuntu-latest
+    # Bumped 15→25 in Plan 05 T15 to accommodate the gVisor wiring:
+    # garage S3 install (~30s), 2-node kind cluster startup (~2m), plus
+    # the original API smoke and the new pause/resume smoke which
+    # exercises real runsc checkpoint+restore + S3 round-trip.
+    timeout-minutes: 25
+    # `KIND_SMOKE_INCLUDE_API=1` opts this job into the Plan 04 T15 api
+    # smoke (helm install with api.enabled=true + the full E2B-compatible
+    # HTTP lifecycle in deploy/kind/fixtures/api-smoke.sh). Setting it
+    # to anything else falls back to the chart-only smoke path — the
+    # historical gate kept available for bisects, even though
+    # post-#134 the api/envd images are *built* unconditionally so
+    # opting out only changes which helm flags + assertions run.
+    env:
+      KIND_SMOKE_INCLUDE_API: '1'
+      # `KIND_SMOKE_INCLUDE_PAUSE_RESUME=1` opts this job into the Plan
+      # 05 T14 pause/resume smoke (issue #150). Plan 05 T15 wired the
+      # full gVisor-backed cluster shape into this job (sandbawks-kind-node
+      # image with runsc pre-baked, MinIO fixture, node DaemonSet enabled
+      # via `node.enabled=true` + `gvisor.enabled=true` + snapshotStore
+      # helm flags below) so the gated step exercises the real S3-backed
+      # snapshot round-trip against a real gVisor sandbox.
+      KIND_SMOKE_INCLUDE_PAUSE_RESUME: '1'
+      # `KIND_SMOKE_REMOTE_SNAPSHOT_STORE` selects the snapshot backend:
+      # '0' = an in-cluster single-node garage (`install-garage.sh`), '1' =
+      # the *central* garage cluster (via the `SCCACHE_*` settings + `AWS_*`
+      # creds, into `SNAPSHOT_BUCKET`; see `use-central-snapshot-store.sh`).
+      #
+      # Default '0' (local): the slow-pause/resume A/B established the local
+      # slowness was our own fixture starving garage of CPU (1-core limit) —
+      # once raised, the central cluster showed no advantage, so CI stays on
+      # the self-contained local garage (no central dependency). Flip to '1'
+      # to re-test against the central cluster.
+      KIND_SMOKE_REMOTE_SNAPSHOT_STORE: '0'
+      # `KIND_SMOKE_INCLUDE_SDK=1` opts this job into the Plan 06 T2 SDK
+      # compat smoke (issue #184). Drives the official `e2b` Python SDK
+      # against the same in-cluster gateway the API and pause/resume
+      # smokes used, sharing the kind cluster + helm install + image
+      # pulls. Same env-gate pattern as the other includes; flip to
+      # anything other than '1' to bypass while keeping the rest of
+      # the smoke green.
+      KIND_SMOKE_INCLUDE_SDK: '1'
+      # `KIND_SMOKE_INCLUDE_SDK_JS=1` opts this job into the Plan 06
+      # T5 JS SDK compat smoke (issue #187). Drives the official
+      # `@e2b/code-interpreter` JS SDK against the same in-cluster
+      # gateway the Python SDK smoke just exercised — a single
+      # gateway-side regression therefore turns up under *both* SDKs
+      # in the same workflow. Filed as p2; flip to anything other
+      # than '1' to bypass while keeping the rest of the smoke green
+      # (e.g. while iterating on the Node toolchain).
+      KIND_SMOKE_INCLUDE_SDK_JS: '1'
+      # `KIND_SMOKE_INCLUDE_WARM_POOL=1` opts this job into the Plan 08
+      # A8 warm-pool claim smoke (issue #261). Reuses the same gVisor +
+      # S3 cluster shape as the pause/resume smoke (a claim resumes a
+      # warm sandbox through the same snapshot path), so it only makes
+      # sense when KIND_SMOKE_INCLUDE_PAUSE_RESUME=1; the step's `if`
+      # guards on both. Flip to anything other than '1' to bypass.
+      KIND_SMOKE_INCLUDE_WARM_POOL: '1'
+      # `KIND_SMOKE_INCLUDE_OTEL=1` opts this job into the issue #311 OTel
+      # end-to-end "collector arrival" smoke. It stands up the in-cluster
+      # debug collector (deploy/kind/fixtures/otel-collector.yaml), installs
+      # the chart with `observability.enabled=true` pointing at it, and — after
+      # the pause/resume smoke has driven every service — asserts that at least
+      # one received span / log record carries the expected `service.name` for
+      # each of sandbawks-api, sandbawks-controller, sandbawks-node, and envd.
+      # node + envd only emit for a real gVisor sandbox, so this gate only
+      # makes sense with KIND_SMOKE_INCLUDE_PAUSE_RESUME=1; the steps guard on
+      # both. Flip to anything other than '1' to bypass.
+      KIND_SMOKE_INCLUDE_OTEL: '1'
+      # `KIND_SMOKE_INCLUDE_AGENTIC=1` opts this job into the issue #423
+      # multi-turn agentic execution smoke (PR #425). Drives four tests that
+      # validate the sandbox as a stateful code-execution environment across
+      # sequential turns — the pattern LLM agents use when driving E2B. The
+      # compound test (`test_agentic_pause_resume_preserves_state` /
+      # `pause → resume preserves agentic state`) exercises the full
+      # gVisor + S3 snapshot path across a pause/resume boundary, so this
+      # gate only makes sense with KIND_SMOKE_INCLUDE_PAUSE_RESUME=1; the
+      # steps guard on both. Flip to anything other than '1' to bypass.
+      KIND_SMOKE_INCLUDE_AGENTIC: '1'
+      # Commit-scoped tag the build job pushed. The smoke pulls each
+      # image at this immutable tag, `kind load`s it under the same tag,
+      # and points the helm install at it via `--set images.*.tag` +
+      # `pullPolicy: Never` (no mutable `:dev` tag, which raced the
+      # parallel bench job on the shared docker daemon).
+      IMAGE_TAG: sha-${{ github.sha }}
+      # Custom kind node image (issue #147) baked with runsc, the
+      # containerd runtime handlers, AND `containerd-shim-sandbawks-v1`
+      # (Plan 07). The published `:latest` is only rebuilt from `main`
+      # (see kind-node-image.yaml), so a PR that changes `shim/**` or
+      # `ci/kind-node/**` must NOT be smoke-tested against `:latest` — it
+      # would lack the PR's own shim/containerd changes and silently
+      # exercise stale behavior (e.g. a resume that cold-starts because a
+      # new `pod_annotations` entry isn't in the image). The cache step
+      # below keys on those source paths; on a miss (i.e. they changed on
+      # this branch) the next step builds the image from source instead
+      # of pulling, so the smoke tests THIS branch's kind-node image.
+      KIND_NODE_IMAGE: ghcr.io/hypotheosis/sandbawks-kind-node:latest
+      # Run-scoped kind cluster name (issue #406), so diagnostics and logs
+      # name the run they came from.
+      CLUSTER_NAME: sandbawks-smoke-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      # Registry login is needed before pulling the commit-scoped workspace
+      # images (private packages while the repository is private).
+      - uses: ./.github/actions/setup-cluster-tools
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Cache the sandbawks-kind-node image as a docker tarball, keyed on
+      # the source files that define it — `ci/kind-node/**` (Dockerfile +
+      # containerd configs) and `shim/**` (the shim binary baked in), plus
+      # the build workflow. A cache HIT means none of those changed on
+      # this branch, so the tarball (a previously built/pulled image) is
+      # current — `docker load` it. A cache MISS means they changed (or
+      # the cache was evicted): the next step builds the image from THIS
+      # branch's source. `shim/**` is in the key (it was not before) so a
+      # shim-only change correctly invalidates. ~250 MiB, so caching the
+      # common no-change case is worthwhile.
+      - name: Cache sandbawks-kind-node image
+        id: cache-sandbawks-kind-node
+        uses: actions/cache@v4
+        with:
+          path: /tmp/sandbawks-kind-node.tar
+          key: sandbawks-kind-node-${{ hashFiles('ci/kind-node/**', 'shim/**', '.github/workflows/kind-node-image.yaml') }}
+      # Decide load-vs-build from the tarball's presence: a present tarball
+      # means a cache hit (load it); absent means the source changed or the
+      # entry was evicted (build from source).
+      - name: Decide kind-node image source
+        id: knode-src
+        run: |
+          if [ -f /tmp/sandbawks-kind-node.tar ]; then
+              echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+              echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+      # buildx (BuildKit, needed by the Dockerfile's `RUN --mount=type=bind`
+      # steps) is set up only on a cache miss so cache-hit runs keep the fast
+      # docker-load path.
+      - name: Set up Docker Buildx
+        id: buildx
+        if: steps.knode-src.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v3
+      - name: Load cached or build sandbawks-kind-node image
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.knode-src.outputs.build }}" = "false" ]; then
+              docker load -i /tmp/sandbawks-kind-node.tar
+          else
+              # Cache miss => `ci/kind-node/**` or `shim/**` changed on this
+              # branch (or the cache was evicted). Build the kind-node image
+              # from source rather than pulling the main-built `:latest`,
+              # which lags PR branches — otherwise a shim/containerd change
+              # in this PR would be smoke-tested against an image that does
+              # not contain it. Building from an unchanged tree reproduces
+              # `:latest` exactly, so this is always correct, just slower.
+              #
+              # `docker buildx build --load` puts the BuildKit result in the
+              # daemon for `kind` + the `docker save` below. Context is the repo root —
+              # the Dockerfile COPYs `shim/` and bind-mounts
+              # `ci/kind-node/*.toml` by repo-relative path.
+              docker buildx build --load \
+                  -f ci/kind-node/Dockerfile \
+                  -t "${KIND_NODE_IMAGE}" .
+              docker save "${KIND_NODE_IMAGE}" -o /tmp/sandbawks-kind-node.tar
+          fi
+      # Docker runs on the runner VM itself, so kind's default loopback
+      # kubeconfig is directly usable. `apiServerPort: 0` lets kind pick a
+      # free ephemeral port.
+      #
+      # We can't reuse deploy/kind/cluster.yaml here: that file is the
+      # local-dev config (random port, default loopback bind) and we
+      # don't want to push CI-specific networking knobs onto developers.
+      # The shape is otherwise identical: two-node (control-plane + worker)
+      # so the snapshot reconciler's `.spec.nodeName` filter has more
+      # than one node to be wrong on, both nodes pinned to the same
+      # sandbawks-kind-node image so runsc + the containerd handler are
+      # present cluster-wide.
+      - name: Create kind cluster
+        run: |
+          set -euo pipefail
+          cat > /tmp/kind-cluster-ci.yaml <<EOF
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          name: ${CLUSTER_NAME}
+          networking:
+            # apiServerPort: 0 → kind binds a free ephemeral port.
+            apiServerPort: 0
+          nodes:
+            - role: control-plane
+              image: ${KIND_NODE_IMAGE}
+            - role: worker
+              image: ${KIND_NODE_IMAGE}
+          EOF
+          kind create cluster \
+              --name "${CLUSTER_NAME}" \
+              --config /tmp/kind-cluster-ci.yaml \
+              --wait 180s
+          kubectl cluster-info
+      # Pull the commit-scoped images the build-images matrix just
+      # pushed and `kind load` them into the cluster. This is the whole
+      # point of issue #134's "smoke re-runs without rebuild" property:
+      # re-running this job is `docker pull` + `kind load` + `helm install`,
+      # no BuildKit involvement.
+      #
+      # The shared script (deploy/kind/fixtures/load-images.sh) uses the
+      # immutable `:${IMAGE_TAG}` tag (not `:dev`) to avoid the cross-job
+      # race described in issue #368, asserts the tag is visible after pull
+      # before calling `kind load`, and retries each image up to 3 times so
+      # a one-off containerd store race self-heals (issue #368).
+      - name: Pull commit-scoped images and load into kind
+        run: bash deploy/kind/fixtures/load-images.sh
+      # CRDs are managed out-of-band; Helm 3 doesn't upgrade chart-managed
+      # CRDs anyway, so the chart no longer ships them. Apply from the
+      # canonical `deploy/crds/` source (regenerated by `crdgen`).
+      - name: Apply CRDs
+        run: kubectl apply -f deploy/crds
+      # Garage is the in-cluster S3 backend the node DaemonSet streams
+      # snapshots into. The fixture applies a single-node garage
+      # Deployment + Service, bootstraps the bucket + access key via
+      # `kubectl exec`, and writes the `sandbawks-snapshot-store` Secret
+      # the node DaemonSet reads via `envFrom`. Must run before the helm
+      # install below so the Secret exists when the DaemonSet first
+      # rolls out — otherwise Pods stay in CreateContainerConfigError.
+      # Only needed when the pause/resume smoke (gVisor mode) runs.
+      #
+      # Two backends, selected by KIND_SMOKE_REMOTE_SNAPSHOT_STORE:
+      #   - '1' (central): point at the central garage cluster via the
+      #     SCCACHE_* connection settings + AWS_* creds, snapshots into
+      #     the SNAPSHOT_BUCKET bucket. Provisions nothing in-cluster.
+      #   - '0' (local): stand up a single-node garage in-cluster. Garage
+      #     replaced a bitnami/minio fixture that was repeatedly flaking
+      #     on Docker Hub pulls; override SANDBAWKS_GARAGE_IMAGE to use a
+      #     mirror.
+      # Either branch writes the `sandbawks-snapshot-store` Secret and
+      # exports SNAPSHOT_STORE_{ENDPOINT,BUCKET,REGION} to $GITHUB_ENV so
+      # the helm install + pause/resume smoke below are backend-agnostic.
+      - name: Provision snapshot store
+        if: env.KIND_SMOKE_INCLUDE_PAUSE_RESUME == '1'
+        env:
+          SCCACHE_ENDPOINT: ${{ vars.SCCACHE_ENDPOINT }}
+          SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
+          SCCACHE_S3_USE_SSL: ${{ vars.SCCACHE_S3_USE_SSL }}
+          SNAPSHOT_BUCKET: ${{ vars.SNAPSHOT_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          if [ "${KIND_SMOKE_REMOTE_SNAPSHOT_STORE:-0}" = "1" ]; then
+              bash deploy/kind/fixtures/use-central-snapshot-store.sh
+          else
+              bash deploy/kind/fixtures/install-garage.sh
+              {
+                  echo "SNAPSHOT_STORE_ENDPOINT=http://garage.default.svc.cluster.local:3900"
+                  echo "SNAPSHOT_STORE_BUCKET=sandbawks-snapshots"
+                  echo "SNAPSHOT_STORE_REGION=us-east-1"
+              } >> "$GITHUB_ENV"
+          fi
+      # Stand up the in-cluster debug OTLP collector BEFORE the helm install
+      # below, so `OTEL_EXPORTER_OTLP_ENDPOINT` resolves the instant the
+      # workloads boot and the first batch export lands rather than being
+      # dropped against a missing Service (issue #311). Idempotent apply +
+      # rollout wait; the arrival assertion runs after the workloads do.
+      - name: Install OTLP collector fixture (issue #311)
+        if: env.KIND_SMOKE_INCLUDE_OTEL == '1' && env.KIND_SMOKE_INCLUDE_PAUSE_RESUME == '1'
+        run: |
+          kubectl apply -f deploy/kind/fixtures/otel-collector.yaml
+          kubectl -n observability rollout status deploy/otel-collector --timeout=120s
+      - name: Helm install (chart-only smoke)
+        if: env.KIND_SMOKE_INCLUDE_API != '1'
+        run: |
+          helm install sandbawks deploy/helm/sandbawks \
+              --skip-crds \
+              --set api.enabled=false \
+              --set node.enabled=false \
+              --set images.controller.repository=ghcr.io/hypotheosis/sandbawks-controller \
+              --set images.controller.tag=${IMAGE_TAG} \
+              --set images.controller.pullPolicy=Never \
+              --wait --timeout 120s
+      # Two helm-install paths under KIND_SMOKE_INCLUDE_API=1:
+      #   - PAUSE_RESUME on: full gVisor wiring (node DaemonSet enabled,
+      #     gvisor RuntimeClass installed, snapshotStore wired to the
+      #     MinIO Secret the fixture seeded).
+      #   - PAUSE_RESUME off: API-only smoke against the cluster's
+      #     default runtime; node DaemonSet stays out (its Pod would
+      #     CrashLoop without a snapshot-store Secret).
+      - name: Helm install (with api, gVisor mode)
+        if: env.KIND_SMOKE_INCLUDE_API == '1' && env.KIND_SMOKE_INCLUDE_PAUSE_RESUME == '1'
+        run: |
+          set -euo pipefail
+          # Point every workload at the in-cluster debug collector when the
+          # OTel arrival smoke is opted in (issue #311). Left empty otherwise,
+          # so the non-OTel path installs exactly as before (observability
+          # defaults to disabled in values.yaml). The controller forwards this
+          # same endpoint into the envd container (issue #345), so all four
+          # services export here.
+          OBS_FLAGS=()
+          if [ "${KIND_SMOKE_INCLUDE_OTEL:-0}" = "1" ]; then
+              OBS_FLAGS=(
+                  --set observability.enabled=true
+                  --set observability.endpoint=http://otel-collector.observability.svc:4318
+                  # Issue #426 — turn on GenAI content capture so the smoke can
+                  # assert envd records (redacted) command lines, exercising the
+                  # full controller-forward + capture chain. Benign smoke
+                  # commands only; never enable blindly in a real deployment.
+                  --set observability.captureGenaiContent=true
+              )
+          fi
+          # snapshotStore.* come from $GITHUB_ENV (set by the "Provision
+          # snapshot store" step) so this install is identical whether the
+          # backend is the in-cluster garage or the central cluster.
+          helm install sandbawks deploy/helm/sandbawks \
+              --skip-crds \
+              --set api.enabled=true \
+              --set api.replicas=1 \
+              --set node.enabled=true \
+              --set gvisor.enabled=true \
+              --set snapshotStore.existingSecret=sandbawks-snapshot-store \
+              --set snapshotStore.endpoint="${SNAPSHOT_STORE_ENDPOINT}" \
+              --set snapshotStore.bucket="${SNAPSHOT_STORE_BUCKET}" \
+              --set snapshotStore.region="${SNAPSHOT_STORE_REGION}" \
+              --set images.api.repository=ghcr.io/hypotheosis/sandbawks-api \
+              --set images.api.tag=${IMAGE_TAG} \
+              --set images.api.pullPolicy=Never \
+              --set images.controller.repository=ghcr.io/hypotheosis/sandbawks-controller \
+              --set images.controller.tag=${IMAGE_TAG} \
+              --set images.controller.pullPolicy=Never \
+              --set images.node.repository=ghcr.io/hypotheosis/sandbawks-node \
+              --set images.node.tag=${IMAGE_TAG} \
+              --set images.node.pullPolicy=Never \
+              --set envd.image=ghcr.io/hypotheosis/envd \
+              --set envd.tag=${IMAGE_TAG} \
+              --set envd.pullPolicy=Never \
+              `# Issue #490: tune the controller's Resuming recovery loop down` \
+              `# for the smoke. The 16 MiB payload stages in seconds, so these` \
+              `# are well above the happy path yet below the smoke's resume wait` \
+              `# budget — a wedged restore surfaces (and the bounded-recovery` \
+              `# loop trips) inside the window instead of hanging. The restore` \
+              `# staging gate itself is shim-side (baked into the kind-node` \
+              `# image), not a Helm value.` \
+              --set controller.restore.scheduleDeadlineSeconds=90 \
+              --set controller.restore.readyDeadlineSeconds=90 \
+              "${OBS_FLAGS[@]}" \
+              --wait --timeout 300s
+      - name: Helm install (with api, no gVisor)
+        if: env.KIND_SMOKE_INCLUDE_API == '1' && env.KIND_SMOKE_INCLUDE_PAUSE_RESUME != '1'
+        run: |
+          helm install sandbawks deploy/helm/sandbawks \
+              --skip-crds \
+              --set api.enabled=true \
+              --set node.enabled=false \
+              --set images.api.repository=ghcr.io/hypotheosis/sandbawks-api \
+              --set images.api.tag=${IMAGE_TAG} \
+              --set images.api.pullPolicy=Never \
+              --set images.controller.repository=ghcr.io/hypotheosis/sandbawks-controller \
+              --set images.controller.tag=${IMAGE_TAG} \
+              --set images.controller.pullPolicy=Never \
+              --set envd.image=ghcr.io/hypotheosis/envd \
+              --set envd.tag=${IMAGE_TAG} \
+              --set envd.pullPolicy=Never \
+              --wait --timeout 180s
+      - name: Smoke assertions
+        run: bash scripts/smoke-assert.sh
+      # The api smoke walks the full E2B-compatible HTTP lifecycle
+      # (create → wait envdAddress → pause → connect → file PUT → list →
+      # file GET → kill). Gated behind KIND_SMOKE_INCLUDE_API=1 so the
+      # historical chart-only path stays unchanged when api smoke is
+      # opted out. The script wakes its own background `kubectl
+      # port-forward` so this step doesn't have to manage one inline.
+      - name: API smoke (Plan 04 T15)
+        if: env.KIND_SMOKE_INCLUDE_API == '1'
+        env:
+          KIND_SMOKE_INCLUDE_API: '1'
+        run: |
+          set -euo pipefail
+          # Background port-forward so the api at svc/sandbawks-api is
+          # reachable on localhost:8080 from this step's shell. The script
+          # itself polls /readyz with a retry loop, so an early-start
+          # race window is tolerated.
+          kubectl port-forward svc/sandbawks-api 8080:8080 \
+              >/tmp/api-pf.log 2>&1 &
+          PF_PID=$!
+          trap "kill ${PF_PID} 2>/dev/null || true" EXIT
+          bash deploy/kind/fixtures/api-smoke.sh
+      # Plan 05 T14 — pause/resume integration test. Drives the full
+      # S3-backed snapshot round-trip (pause → mc ls → delete pod →
+      # resume → file round-trip → kill). The api-smoke step's
+      # port-forward is shell-local (killed by its EXIT trap), so this
+      # step opens its own — the script polls /readyz on attach so a
+      # brief race against `kubectl port-forward` is tolerated.
+      - name: Pause/resume smoke (Plan 05 T14)
+        if: env.KIND_SMOKE_INCLUDE_PAUSE_RESUME == '1'
+        env:
+          # Emit per-phase JUnit timings (see pause-resume-smoke.sh's `phase`
+          # markers) so the upload step below publishes them as a
+          # `pause-resume-smoke-results` artifact, mirroring the SDK suite.
+          # Workspace-root path so the upload `path:` (workspace-relative)
+          # matches what the script writes.
+          PAUSE_RESUME_SMOKE_JUNIT: ${{ github.workspace }}/pause-resume-smoke-results.xml
+          # Drive the smoke's S3 bundle-verification (`mc ls`) at the same
+          # backend the chart was wired to. Both vars come from the
+          # "Provision snapshot store" step via $GITHUB_ENV, so the smoke
+          # checks the central garage cluster when remote, the in-cluster
+          # garage Service when local.
+          SANDBAWKS_S3_BUCKET: ${{ env.SNAPSHOT_STORE_BUCKET }}
+          SANDBAWKS_SMOKE_S3_ENDPOINT_URL: ${{ env.SNAPSHOT_STORE_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          kubectl port-forward svc/sandbawks-api 8080:8080 \
+              >/tmp/pause-resume-pf.log 2>&1 &
+          PF_PID=$!
+          trap "kill ${PF_PID} 2>/dev/null || true" EXIT
+          bash deploy/kind/fixtures/pause-resume-smoke.sh
+      # Publish the pause/resume phase timings as a JUnit artifact, the same
+      # way the SDK suite does. `if: always()` so a failed smoke still uploads
+      # the report (with the in-flight phase marked <failure>).
+      - name: Upload pause/resume smoke junit results
+        if: always() && env.KIND_SMOKE_INCLUDE_PAUSE_RESUME == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pause-resume-smoke-results
+          path: pause-resume-smoke-results.xml
+          if-no-files-found: warn
+      # Plan 08 A8 (issue #261) — warm-pool claim smoke. Applies a
+      # SandboxWarmPool(minReady=1), waits for status.ready==1 (the
+      # controller cold-boots one sandbox and auto-pauses it via the same
+      # S3 snapshot path the pause/resume smoke just proved), then asserts
+      # a POST /sandboxes returns the warm sandbox's name (a claim, not a
+      # cold-boot) and the claimed sandbox resumes to Running. Gated on
+      # both API + PAUSE_RESUME since it reuses their gVisor + S3 wiring;
+      # opens its own shell-local port-forward like the steps above.
+      - name: Warm-pool claim smoke (Plan 08 A8)
+        if: env.KIND_SMOKE_INCLUDE_WARM_POOL == '1' && env.KIND_SMOKE_INCLUDE_API == '1' && env.KIND_SMOKE_INCLUDE_PAUSE_RESUME == '1'
+        run: |
+          set -euo pipefail
+          kubectl port-forward svc/sandbawks-api 8080:8080 \
+              >/tmp/warm-pool-pf.log 2>&1 &
+          PF_PID=$!
+          trap "kill ${PF_PID} 2>/dev/null || true" EXIT
+          bash deploy/kind/fixtures/warm-pool-smoke.sh
+      # Issue #311 — OTel end-to-end "collector arrival" smoke. Runs AFTER the
+      # pause/resume + warm-pool smokes so every service has had a sandbox
+      # lifecycle action to emit on: api + controller emit on any action, node
+      # + envd only for a real gVisor sandbox (which those smokes create). The
+      # collector fixture is already up (installed before the helm step) and
+      # the chart was installed with observability pointed at it, so this step
+      # only has to assert arrival — it polls the collector's debug-exporter
+      # stdout until at least one signal bearing each expected `service.name`
+      # has landed, or fails with the set it did see. No port-forward needed:
+      # the assertion reads `kubectl logs`, not the api gateway.
+      - name: OTel arrival smoke (issue #311)
+        if: env.KIND_SMOKE_INCLUDE_OTEL == '1' && env.KIND_SMOKE_INCLUDE_API == '1' && env.KIND_SMOKE_INCLUDE_PAUSE_RESUME == '1'
+        env:
+          # Issue #426 — additionally require envd's GenAI execute_tool spans,
+          # AND (since the smoke installs with captureGenaiContent=true) that
+          # the redacted command line is captured. The pause/resume smoke's
+          # `/files/mint` PUT+GET exercises envd's WriteAll / ReadAll, which
+          # emit `fs.write` / `fs.read` execute_tool spans carrying a
+          # `gen_ai.tool.call.arguments` attribute, so both have reached the
+          # collector by the time this step polls. The bare `gen_ai.tool.call.
+          # arguments` asserts presence (its exact value is the redacted path).
+          OTEL_SMOKE_EXPECTED_ATTRS: "gen_ai.operation.name=execute_tool gen_ai.tool.call.arguments"
+        run: bash deploy/kind/fixtures/otel-arrival-smoke.sh
+      # Plan 06 T2 (issue #184) — drive the official `e2b` Python SDK
+      # against the same in-cluster gateway. Runs *after* the pause/resume
+      # smoke so the cluster, helm install, gVisor wiring, and snapshot
+      # store are all proven healthy before the SDK suite layers on top.
+      # The harness is a `uv`-managed pytest project in
+      # `tests/e2b-sdk-compat/`; `just sdk-smoke` does the `uv sync` +
+      # `uv run pytest` in there. junit XML is emitted so the workflow
+      # can publish it as a CI artifact for downstream inspection.
+      #
+      # Implicit cross-step dependency: the SDK harness's `conftest.py`
+      # defaults `E2B_API_KEY=sbk_smoke_smoke_…` and
+      # `template_id=api-smoke-template`, both of which are seeded
+      # in-cluster by the earlier `API smoke (Plan 04 T15)` step via
+      # `deploy/kind/fixtures/api-smoke.sh`. Today this holds because
+      # `KIND_SMOKE_INCLUDE_API=1` is the only path that installs the
+      # chart with `api.enabled=true`; if a future caller sets
+      # `KIND_SMOKE_INCLUDE_API=0` while leaving `KIND_SMOKE_INCLUDE_SDK=1`
+      # the SDK suite will 401/404 without a clear cause. Either keep
+      # the two gates moving together or seed the fixture independently.
+
+      - name: Install uv (Plan 06 T2)
+        if: env.KIND_SMOKE_INCLUDE_SDK == '1'
+        uses: astral-sh/setup-uv@v6
+        with:
+          # Cache `~/.cache/uv` keyed on the harness's `uv.lock`. Saves
+          # a few seconds per run by skipping `uv sync`'s wheel
+          # download/build when the lockfile is unchanged. Not
+          # load-bearing — kind cluster startup and image pulls
+          # dominate the job's runtime — but free.
+          enable-cache: true
+      - name: SDK compat smoke (Plan 06 T2)
+        if: env.KIND_SMOKE_INCLUDE_SDK == '1'
+        run: |
+          set -euo pipefail
+          # Fail fast (with a clear message) if the api deployment is
+          # not Available — without this we would only see opaque
+          # `curl: (7) connection refused` from the readiness probe
+          # below. helm install --wait should have already done this
+          # in the install step, so a non-zero here would indicate a
+          # real regression rather than a startup race.
+          #
+          # The prior api-smoke / pause-resume-smoke port-forwards are
+          # already gone: each step's EXIT trap kills its own.
+          kubectl rollout status deployment/sandbawks-api --timeout=60s
+          kubectl port-forward svc/sandbawks-api 8080:8080 \
+              >/tmp/sdk-smoke-pf.log 2>&1 &
+          PF_PID=$!
+          trap "kill ${PF_PID} 2>/dev/null || true" EXIT
+          # Wait for the port-forward to be reachable before the SDK
+          # makes its first call. The API/pause-resume scripts poll
+          # `/readyz` internally; the e2b SDK does not — `Sandbox.create`
+          # is the very first call and would otherwise hit whatever
+          # state the port-forward happens to be in. `--retry-all-errors`
+          # is broader than `--retry-connrefused` and covers
+          # partially-bound-socket failure modes. 60 × 1s gives the port-forward a
+          # generous budget on a contended runner.
+          curl -fsS --retry 60 --retry-delay 1 \
+              --retry-connrefused --retry-all-errors \
+              http://localhost:8080/readyz >/dev/null
+          # `just` is not installed on the runner, so inline
+          # the equivalent of `just sdk-smoke` (which the local-dev
+          # docs still point at). Pin the junit output to an absolute
+          # path because we `cd` into the harness directory before
+          # invoking pytest; a relative path would land there and not
+          # match the `path:` the upload step reads (workspace-root
+          # relative).
+          cd tests/e2b-sdk-compat
+          uv sync
+          uv run pytest -v \
+              --junitxml="${GITHUB_WORKSPACE}/sdk-smoke-results.xml"
+      - name: Upload SDK smoke junit results
+        if: always() && env.KIND_SMOKE_INCLUDE_SDK == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-smoke-results
+          path: sdk-smoke-results.xml
+          if-no-files-found: warn
+      # Issue #426 — prove envd's *process*-spawn GenAI spans (not only the
+      # fs.* ones the arrival smoke already saw) reach the collector with the
+      # exit outcome recorded. The Python SDK's `test_commands_run_nonzero_exit`
+      # runs `sh -c 'exit 17'`, so a process `execute_tool` span tagged
+      # `error.type=non_zero_exit` must have landed. Attrs-only (empty service
+      # list), collector already up (APPLY=0). Reuses the arrival-smoke parser.
+      - name: OTel GenAI process-span smoke (issue #426)
+        if: env.KIND_SMOKE_INCLUDE_OTEL == '1' && env.KIND_SMOKE_INCLUDE_SDK == '1'
+        env:
+          OTEL_SMOKE_EXPECTED_SERVICES: ""
+          OTEL_SMOKE_EXPECTED_ATTRS: "error.type=non_zero_exit"
+          OTEL_SMOKE_APPLY_COLLECTOR: "0"
+        run: bash deploy/kind/fixtures/otel-arrival-smoke.sh
+      # Plan 06 T5 (issue #187) — drive the official
+      # `@e2b/code-interpreter` JS SDK against the same in-cluster
+      # gateway the Python SDK smoke just exercised. Sequential
+      # (not parallel) sibling of the Python SDK step in this single
+      # `kind-smoke` job: the two share the kind cluster + helm
+      # install + image pulls + seeded fixtures, so a regression in
+      # the gateway's E2B-compat surface shows up under *both* SDKs
+      # in the same workflow run.
+      #
+      # Implicit cross-step dependency: same as the Python SDK step
+      # (api-smoke seeds the SandboxTemplate + TeamAPIKey the harness
+      # defaults to). If a future caller flips `KIND_SMOKE_INCLUDE_API=0`
+      # while leaving `KIND_SMOKE_INCLUDE_SDK_JS=1`, the JS suite will
+      # 401/404 without a clear cause — same caveat as the Python step.
+
+      - name: Setup Node.js (Plan 06 T5)
+        if: env.KIND_SMOKE_INCLUDE_SDK_JS == '1'
+        uses: actions/setup-node@v4
+        with:
+          # `e2b` >= 2.61 (and its `undici` 8) declare
+          # `engines.node >= 22.19.0`; '22' resolves to the latest 22.x.
+          node-version: '22'
+          # Cache `~/.npm` keyed on the harness's `package-lock.json`.
+          # Saves a few seconds per run by skipping `npm install`'s
+          # tarball downloads when the lockfile is unchanged. Not
+          # load-bearing — kind cluster startup dominates — but free.
+          cache: 'npm'
+          cache-dependency-path: tests/e2b-sdk-compat-js/package-lock.json
+      - name: SDK compat smoke JS (Plan 06 T5)
+        if: env.KIND_SMOKE_INCLUDE_SDK_JS == '1'
+        env:
+          # Vitest writes junit to this path when set (see
+          # `tests/e2b-sdk-compat-js/vitest.config.ts`). Absolute so
+          # the file lands at the workspace root regardless of which
+          # directory `npm test` runs in.
+          JUNIT_OUTPUT_FILE: ${{ github.workspace }}/sdk-smoke-js-results.xml
+        run: |
+          set -euo pipefail
+          # The Python SDK step already validated the api is up; we
+          # repeat the rollout-status / curl handshake here so a wedge
+          # introduced between the two SDK steps fails this step with
+          # a clear cause rather than letting vitest hit /readyz blind.
+          kubectl rollout status deployment/sandbawks-api --timeout=60s
+          kubectl port-forward svc/sandbawks-api 8080:8080 \
+              >/tmp/sdk-smoke-js-pf.log 2>&1 &
+          PF_PID=$!
+          trap "kill ${PF_PID} 2>/dev/null || true" EXIT
+          curl -fsS --retry 60 --retry-delay 1 \
+              --retry-connrefused --retry-all-errors \
+              http://localhost:8080/readyz >/dev/null
+          # `just` is not installed on the runner, so inline
+          # the equivalent of `just sdk-smoke-js`. Use `npm ci` over
+          # `npm install` here so CI fails fast on a lockfile drift
+          # rather than silently upgrading transitive deps.
+          cd tests/e2b-sdk-compat-js
+          if [ -f package-lock.json ]; then
+              npm ci
+          else
+              npm install
+          fi
+          npm test
+      - name: Upload SDK smoke (JS) junit results
+        if: always() && env.KIND_SMOKE_INCLUDE_SDK_JS == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-smoke-js-results
+          path: sdk-smoke-js-results.xml
+          if-no-files-found: warn
+      # Issue #423 / PR #425 — multi-turn agentic execution smoke (Python).
+      # Drives the four `@pytest.mark.agentic` tests from
+      # `tests/e2b-sdk-compat/tests/test_agentic_turn.py` as a distinct CI
+      # gate, separate from the general SDK compat sweep above. The compound
+      # test (`test_agentic_pause_resume_preserves_state`) creates its own
+      # Sandbox and calls `sbx.pause()`, exercising the full gVisor + S3
+      # snapshot path across a pause/resume boundary. Gated on PAUSE_RESUME
+      # (+ API) because without gVisor the compound test's `sbx.pause()` call
+      # cannot succeed. Opens its own shell-local port-forward (the SDK smoke
+      # step's EXIT trap has already killed the prior one). `uv sync` is a
+      # no-op after the SDK smoke step's cache hit on the same lockfile.
+      - name: Agentic turn smoke - Python (issue #423)
+        if: env.KIND_SMOKE_INCLUDE_AGENTIC == '1' && env.KIND_SMOKE_INCLUDE_SDK == '1' && env.KIND_SMOKE_INCLUDE_API == '1' && env.KIND_SMOKE_INCLUDE_PAUSE_RESUME == '1'
+        run: |
+          set -euo pipefail
+          kubectl rollout status deployment/sandbawks-api --timeout=60s
+          kubectl port-forward svc/sandbawks-api 8080:8080 \
+              >/tmp/agentic-smoke-pf.log 2>&1 &
+          PF_PID=$!
+          trap "kill ${PF_PID} 2>/dev/null || true" EXIT
+          curl -fsS --retry 60 --retry-delay 1 \
+              --retry-connrefused --retry-all-errors \
+              http://localhost:8080/readyz >/dev/null
+          cd tests/e2b-sdk-compat
+          uv sync
+          uv run pytest -v -m agentic \
+              --junitxml="${GITHUB_WORKSPACE}/sdk-smoke-agentic-results.xml"
+      - name: Upload agentic smoke junit results (Python)
+        if: always() && env.KIND_SMOKE_INCLUDE_AGENTIC == '1' && env.KIND_SMOKE_INCLUDE_SDK == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-smoke-agentic-results
+          path: sdk-smoke-agentic-results.xml
+          if-no-files-found: warn
+      # Issue #423 / PR #425 — multi-turn agentic execution smoke (JS).
+      # Mirrors the Python agentic step above using `@e2b/code-interpreter`'s
+      # `Sandbox` API (vitest, `tests/e2b-sdk-compat-js/tests/agentic_turn.test.ts`).
+      # Passes `agentic_turn` as a vitest file-name filter so only those four
+      # tests run here; the full suite already ran in the SDK JS smoke step.
+      # Opens its own shell-local port-forward for the same reason as the
+      # Python step. `npm ci` reuses the npm cache keyed in the setup-node
+      # step above — no extra download.
+      - name: Agentic turn smoke - JS (issue #423)
+        if: env.KIND_SMOKE_INCLUDE_AGENTIC == '1' && env.KIND_SMOKE_INCLUDE_SDK_JS == '1' && env.KIND_SMOKE_INCLUDE_API == '1' && env.KIND_SMOKE_INCLUDE_PAUSE_RESUME == '1'
+        env:
+          JUNIT_OUTPUT_FILE: ${{ github.workspace }}/sdk-smoke-agentic-js-results.xml
+        run: |
+          set -euo pipefail
+          kubectl rollout status deployment/sandbawks-api --timeout=60s
+          kubectl port-forward svc/sandbawks-api 8080:8080 \
+              >/tmp/agentic-smoke-js-pf.log 2>&1 &
+          PF_PID=$!
+          trap "kill ${PF_PID} 2>/dev/null || true" EXIT
+          curl -fsS --retry 60 --retry-delay 1 \
+              --retry-connrefused --retry-all-errors \
+              http://localhost:8080/readyz >/dev/null
+          cd tests/e2b-sdk-compat-js
+          if [ -f package-lock.json ]; then
+              npm ci
+          else
+              npm install
+          fi
+          npm test -- agentic_turn
+      - name: Upload agentic smoke junit results (JS)
+        if: always() && env.KIND_SMOKE_INCLUDE_AGENTIC == '1' && env.KIND_SMOKE_INCLUDE_SDK_JS == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-smoke-agentic-js-results
+          path: sdk-smoke-agentic-js-results.xml
+          if-no-files-found: warn
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get all -A
+          kubectl describe deploy/sandbawks-controller || true
+          kubectl logs deploy/sandbawks-controller --tail=200 || true
+          kubectl describe deploy/sandbawks-api || true
+          kubectl logs deploy/sandbawks-api --tail=200 || true
+          # The node DaemonSet is the actor that runs `runsc checkpoint`,
+          # so a pause-side failure (e.g. the #237 mount-set assertion
+          # rejecting a mount) only surfaces in *its* log — not the
+          # controller's. Dump it so pause failures are diagnosable from
+          # the CI output alone instead of needing a local repro.
+          kubectl describe ds/sandbawks-node || true
+          kubectl logs ds/sandbawks-node --tail=500 || true
+          kubectl get sandbox -A -o yaml || true
+          kubectl get snapshotjob -A -o yaml || true
+          # When the OTel arrival smoke (issue #311) is what failed, the answer
+          # is in the collector's own stdout — it shows exactly which
+          # service.name attributes did and didn't reach the debug exporter.
+          kubectl -n observability describe deploy/otel-collector || true
+          kubectl -n observability logs deploy/otel-collector --tail=500 || true
+          kubectl get events -A --sort-by=.lastTimestamp
+          cat /tmp/api-pf.log 2>/dev/null || true
+          cat /tmp/pause-resume-pf.log 2>/dev/null || true
+          cat /tmp/sdk-smoke-pf.log 2>/dev/null || true
+          cat /tmp/sdk-smoke-js-pf.log 2>/dev/null || true
+          cat /tmp/agentic-smoke-pf.log 2>/dev/null || true
+          cat /tmp/agentic-smoke-js-pf.log 2>/dev/null || true
+      # Render all five JUnit suites (pause/resume + SDK Py + SDK JS + agentic
+      # Py + agentic JS) into a single, upserted PR comment: the XML is parsed
+      # in Node and POST/PATCHed via the issue-comments REST API with the job
+      # token. Best-effort — the script
+      # always exits 0, so a comment hiccup never fails the gate. `always()`
+      # so a red run still reports its failures; gated to pull_request because
+      # a comment needs a PR (and fork PRs, which get no token, skip this whole
+      # job anyway). Files absent because a suite was toggled off are rendered
+      # as "not run", not an error.
+      - name: Comment JUnit results on PR
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node ci/junit-pr-comment.mjs \
+            "${GITHUB_WORKSPACE}/pause-resume-smoke-results.xml" \
+            "${GITHUB_WORKSPACE}/sdk-smoke-results.xml" \
+            "${GITHUB_WORKSPACE}/sdk-smoke-js-results.xml" \
+            "${GITHUB_WORKSPACE}/sdk-smoke-agentic-results.xml" \
+            "${GITHUB_WORKSPACE}/sdk-smoke-agentic-js-results.xml"
+
+  # ---------------------------------------------------------------------
+  # Plan 06 T3 (issue #185) — pause/resume perf bench. Folded into this
+  # workflow (issue #193 follow-up) so a single `build-images` job feeds
+  # both the kind-smoke gate above and this perf gate. The two test
+  # jobs run in parallel as siblings of `build-images`; a perf
+  # regression turns up under its own check name in PR status,
+  # separately from a correctness regression (issue #185: "perf
+  # failures show up distinctly from correctness failures").
+  #
+  # Cluster shape (matches kind-smoke's gVisor path): a single-node
+  # kind cluster on the runsc-baked sandbawks-kind-node image, helm-
+  # installed with node DaemonSet + gVisor enabled + Garage as the
+  # snapshot S3 backend. Without this exact shape the controller's
+  # pause path can't drive `runsc checkpoint` and every iteration
+  # times out on the bench's 60 s wait_for_phase budget.
+  #
+  # Resume gate (`BENCH_INCLUDE_RESUME`) is ON. Plan 07 (epic #204)
+  # closed the runtime-side gap from #176: `containerd-shim-sandbawks-v1`
+  # mediates a kubelet-managed `runsc restore` (memory-only restore,
+  # PR #234). Epic #484 then re-architected resume to *scheduler-placed,
+  # create-then-stage*: the controller creates the restore Pod first, learns
+  # the node the scheduler bound it to, and stages the snapshot onto that node;
+  # the restore shim (`containerd-shim-sandbawks-v1`, baked into the kind-node
+  # image) then holds the root container's `runsc restore` until the node's
+  # `.staged` marker (#487) lands. Issue #490 closes that chain — the shim gate
+  # plus the controller's `Resuming` recovery deadlines (`--set` above) — so
+  # this is the phase where the GiB resume bench is validated green end-to-end
+  # (schedule → stage → marker → shim-gated restore → Running) rather than
+  # hanging at `Resuming`. The bench runs its own create→pause→resume loop via
+  # the gateway and enforces the resume p95 ceiling alongside the pause gate
+  # (#196).
+  # ---------------------------------------------------------------------
+  bench:
+    needs: build-images
+    # Opt-in only (#571): the GiB-scale snapshot bench (timeout 75 min) is
+    # rarely needed, so it runs only when the PR explicitly carries the
+    # `benchmark` label — not on every same-repo PR. The fork-PR predicate is
+    # preserved (no registry pull on forks). The label intentionally overrides
+    # the path filter: a labelled docs-only PR still benches (build-images is
+    # forced for it by the same label), an accepted explicit override.
+    if: >-
+      github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && contains(github.event.pull_request.labels.*.name, 'benchmark')
+    runs-on: ubuntu-latest
+    # GiB-scale bench (issue #291): a 1024 MiB payload uploads as ~1024
+    # sequential 1-MiB PUTs per iteration, plus a runsc checkpoint /
+    # lazy-restore of a ~1 GiB bundle each cycle. At N=5 that is far
+    # slower than the old 16 MiB run, so the per-job ceiling is raised
+    # 35 -> 75 min to fit cluster bring-up + 5 GiB-scale lifecycles with
+    # comfortable headroom.
+    timeout-minutes: 75
+    env:
+      IMAGE_TAG: sha-${{ github.sha }}
+      # Runsc-baked node image (issue #147) — same one the gVisor
+      # path of kind-smoke uses. The controller stamps
+      # `runtimeClassName: gvisor` on sandbox Pods (from the seeded
+      # template's `defaultRuntimeClass: gvisor`), and this node image
+      # provides the matching containerd runtime handler so kubelet
+      # can actually launch a runsc-backed container. Without this
+      # the bench's pause iteration would time out — pause is a
+      # runsc checkpoint operation.
+      KIND_NODE_IMAGE: ghcr.io/hypotheosis/sandbawks-kind-node:latest
+      # Run-scoped kind cluster name (issue #406); see the kind-smoke job.
+      CLUSTER_NAME: sandbawks-bench-${{ github.run_id }}
+      # Snapshot backend for the bench: '0' = in-cluster single-node garage
+      # (`install-garage.sh`), '1' = the central cluster (SCCACHE_* + AWS_* →
+      # SNAPSHOT_BUCKET; see use-central-snapshot-store.sh).
+      #
+      # Default '0' (local): the GiB A/B showed the local slowness was our
+      # fixture's 1-core garage CPU limit (now raised to 8); with that fixed
+      # the central cluster showed no performance gain, so the bench stays on
+      # the self-contained local garage. Flip to '1' to re-test central.
+      KIND_SMOKE_REMOTE_SNAPSHOT_STORE: '0'
+      # Bench tunables (see `tests/bench/src/main.rs`):
+      #
+      # ## Current state: real measurement (#193 + #194 both fixed)
+      #
+      # - #193 fixed: pause-side snapshot bundle carries real runsc
+      #   checkpoint state (was `memory*` vs `*.img` glob mismatch in
+      #   the node DaemonSet bundler).
+      # - #194 fixed: node reconciler's idempotency floor now covers
+      #   in-flight phases too, so a stale-cache kube-rs Controller
+      #   re-fire can't double-dispatch pause() and overwrite a
+      #   successful Complete with a /__state-timeout Failed.
+      #
+      # With both fixed, the bench gate is meaningful for any payload
+      # size and iteration count. The JSON report records per-
+      # iteration `bytes_bundle` + per-part sizes so a regression to
+      # either old shape (tiny bundle, or transient pause failure)
+      # would fail either the bundle-floor gate or the iteration
+      # itself rather than silently passing.
+      #
+      # Iterations: 5. With only 3 the reported p95 is effectively the
+      # max of the sample, so a single slow restore flakes the gate; 5
+      # gives the resume gate statistical headroom for ~2 extra sandbox
+      # lifecycles. Local `just bench` defaults to N=20 / 1024 MiB; CI
+      # keeps N=5 to bound the per-job wall-clock now that each lifecycle
+      # moves a GiB (see the timeout bump above).
+      #
+      # Payload: 1024 MiB (issue #291). This is the GiB scale spec §13
+      # targets are written against — and the scale at which Plan 08's
+      # lazy / page-fault restore (#262/#290) actually dominates resume,
+      # since the memory-restore step scales with checkpoint size. The
+      # old 16 MiB run was too small for lazy restore to register: resume
+      # there was all fixed pod-lifecycle overhead. Each iteration uploads
+      # 1024 sequential 1-MiB PUTs (the gateway's per-file ceiling, see
+      # `UPLOAD_CHUNK_BYTES` in the bench), so the rootfs delta the
+      # snapshot path moves on pause is ~1 GiB. The seeded SandboxTemplate
+      # already sizes ephemeralStorage at 2Gi for exactly this payload.
+      BENCH_ITERATIONS: '5'
+      BENCH_PAYLOAD_MIB: '1024'
+      # Resume measurement is ON at GiB scale again — #302 fixed by #325. The
+      # earlier GiB resume failure was misdiagnosed as a checkpoint/SIGTERM
+      # race; the real cause was envd self-terminating ~60 s after boot:
+      # `tokio::time::timeout(DRAIN_TIMEOUT, serve_task)` bounded the *serving
+      # lifetime* instead of the post-signal drain, so with no signal ever sent
+      # envd exited 0 at boot+60 s. A slow GiB `runsc checkpoint` captured envd
+      # already mid-(spurious)-shutdown, and the restored process replayed the
+      # exit (Sandbox stuck `Resuming`); a fast 16 MiB checkpoint finished
+      # before the timers fired, which is why small payloads "worked". #325's
+      # `join_with_drain_cap` gates the drain cap on the shutdown broadcast, so
+      # an un-signalled envd serves indefinitely and is checkpointed healthy.
+      # With this `1`, the harness drives the full
+      # create→upload→pause→kill→/connect loop and the resume budget / p95 gate
+      # below are LIVE again.
+      BENCH_INCLUDE_RESUME: '1'
+      # Per-phase HARD TIMEOUTS (not perf gates — those are the *_P95_MS
+      # below). These bound how long the bench waits for a phase to reach
+      # its target status before failing the iteration; the bench's code
+      # defaults are 60 s each, sized for small payloads. A GiB-scale pause
+      # is a real `runsc checkpoint` + tar/zstd + Garage S3 upload of a
+      # ~1 GiB bundle and legitimately exceeds 60 s on this constrained
+      # runner — the first GiB CI run hard-timed-out at `Pausing` after 60 s
+      # before writing any results. Raise the budgets so a slow-but-working
+      # phase COMPLETES (and gets measured + reported) instead of aborting.
+      # Each budget stays above its matching *_P95_MS gate so a slow phase
+      # trips the perf gate with a clean message rather than this timeout,
+      # and the worst case (every phase maxing its budget) stays inside the
+      # 75-minute job ceiling. Envd readiness is payload-independent (just
+      # envd reachable) but bumped for slow-runner headroom.
+      BENCH_ENVD_READY_BUDGET_SECS: '120'
+      BENCH_PAUSE_BUDGET_SECS: '300'
+      BENCH_RESUME_BUDGET_SECS: '300'
+      # Pause p95 ceiling. Spec §13's target is 8 s @ ~1 GiB, enforced
+      # locally by the bench's `DEFAULT_PAUSE_P95_MS = 8000`. On THIS
+      # constrained CI runner the first GiB run showed pause alone (POST
+      # /pause -> phase=Paused) exceeding 60 s — runsc checkpoint + zstd +
+      # Garage upload of ~1 GiB carries fixed overhead far above the bare
+      # spec ceiling without being a regression. The CI gate is therefore a
+      # generous, PROVISIONAL constrained-runner ceiling (240000 ms) — still
+      # BLOCKING, so a genuinely-wedged pause fails the job, but loose enough
+      # that a working GiB pause passes. The real per-run number is published
+      # to the PR via `ci/bench-pr-comment.mjs`; calibrate this ceiling down
+      # from the observed p95 once a few runs establish a baseline, or move
+      # the tight gate to a dedicated heavier bench runner (#291 option (b)).
+      BENCH_PAUSE_P95_MS: '240000'
+      # Resume p95 ceiling. Spec §13's target is 2 s @ 1 GiB, enforced
+      # locally by the bench's `DEFAULT_RESUME_P95_MS = 2000`. Lazy /
+      # page-fault restore (`RestoreConfig.Background=true`, Plan 08 B1
+      # #262) returns from `runsc restore` Start before every page is
+      # faulted — a win concentrated in the *memory-restore* step, which is
+      # why this job runs at GiB scale (issue #291): only there does the
+      # page-fault win dominate over fixed pod-lifecycle overhead (stage
+      # download, stale-Pod teardown, Pod create, envd boot).
+      #
+      # Like the pause gate, this is a generous PROVISIONAL ceiling
+      # (180000 ms), BLOCKING but loose enough that a working GiB restore
+      # passes on this runner — #291 flags the runner's fixed overhead as a
+      # floor that can hold end-to-end resume well above the 2 s spec target.
+      # Gating at the spec target would red every PR on overhead, not
+      # regression. Track the real resume p95 via the PR timing-table comment
+      # and tighten toward 2 s from data (or move to a dedicated runner per
+      # #291 option (b)). Record the observed GiB-scale lazy p95 here once a
+      # few CI runs establish a baseline.
+      BENCH_RESUME_P95_MS: '180000'
+      # Write results to the workspace root so the upload-artifact
+      # step's `path: bench-results.json` resolves. `cargo run` cwd's
+      # to `tests/bench/`, so we have to override the default
+      # relative path to land in the workspace root regardless.
+      BENCH_RESULTS_PATH: ${{ github.workspace }}/bench-results.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-cluster-tools
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Cache the sandbawks-kind-node image (~250 MiB) as a docker
+      # tarball — same scheme kind-smoke uses, including the build-on-miss
+      # behavior. Key invalidates when `ci/kind-node/**` or `shim/**`
+      # changes; on cache hit `docker load`, on miss build from THIS
+      # branch's source (so a shim/containerd change is benched against
+      # the image that contains it, not the lagging main-built `:latest`).
+      - name: Cache sandbawks-kind-node image
+        id: cache-sandbawks-kind-node
+        uses: actions/cache@v4
+        with:
+          path: /tmp/sandbawks-kind-node.tar
+          key: sandbawks-kind-node-${{ hashFiles('ci/kind-node/**', 'shim/**', '.github/workflows/kind-node-image.yaml') }}
+      # Same load-vs-build decision + buildx setup as the kind-smoke job
+      # (see there for the full rationale). Check the tarball directly
+      # rather than the cache action's `cache-hit` output.
+      - name: Decide kind-node image source
+        id: knode-src
+        run: |
+          if [ -f /tmp/sandbawks-kind-node.tar ]; then
+              echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+              echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Set up Docker Buildx
+        id: buildx
+        if: steps.knode-src.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v3
+      - name: Load cached or build sandbawks-kind-node image
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.knode-src.outputs.build }}" = "false" ]; then
+              docker load -i /tmp/sandbawks-kind-node.tar
+          else
+              # `:latest` only republishes from `main`, so on a cache miss
+              # (source changed, or eviction) build from THIS branch's
+              # source rather than pull a stale image. Context is the repo
+              # root.
+              docker buildx build --load \
+                  -f ci/kind-node/Dockerfile \
+                  -t "${KIND_NODE_IMAGE}" .
+              docker save "${KIND_NODE_IMAGE}" -o /tmp/sandbawks-kind-node.tar
+          fi
+
+      - name: Create kind cluster (single node, runsc-baked)
+        run: |
+          set -euo pipefail
+          cat > /tmp/kind-cluster-bench.yaml <<EOF
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          name: ${CLUSTER_NAME}
+          networking:
+            # apiServerPort: 0 → kind binds a free ephemeral port.
+            apiServerPort: 0
+          nodes:
+            - role: control-plane
+              image: ${KIND_NODE_IMAGE}
+          EOF
+          kind create cluster \
+              --name "${CLUSTER_NAME}" \
+              --config /tmp/kind-cluster-bench.yaml \
+              --wait 180s
+          kubectl cluster-info
+
+      # Same shared loader as the smoke job: immutable `:${IMAGE_TAG}` tag,
+      # `docker image inspect` guard after pull, 3-attempt retry per image.
+      # Includes sandbawks-node (issue #185): the node DaemonSet runs
+      # `runsc checkpoint` on pause and would CrashLoop without this image.
+      # See deploy/kind/fixtures/load-images.sh for the full rationale.
+      - name: Pull commit-scoped images and load into kind
+        run: bash deploy/kind/fixtures/load-images.sh
+
+      - name: Apply CRDs
+        run: kubectl apply -f deploy/crds
+
+      # Snapshot backend the node DaemonSet streams snapshots into,
+      # selected by KIND_SMOKE_REMOTE_SNAPSHOT_STORE:
+      #   - '1' (central): the central garage cluster via SCCACHE_* +
+      #     AWS_*, into SNAPSHOT_BUCKET. Provisions nothing in-cluster.
+      #   - '0' (local): a single-node garage Deployment + Service,
+      #     bootstrapped bucket + access key.
+      # Either branch writes the `sandbawks-snapshot-store` Secret the
+      # DaemonSet reads via `envFrom` and exports SNAPSHOT_STORE_* to
+      # $GITHUB_ENV. Must run before the helm install below so the Secret
+      # exists when the DaemonSet first rolls out.
+      - name: Provision snapshot store
+        env:
+          SCCACHE_ENDPOINT: ${{ vars.SCCACHE_ENDPOINT }}
+          SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
+          SCCACHE_S3_USE_SSL: ${{ vars.SCCACHE_S3_USE_SSL }}
+          SNAPSHOT_BUCKET: ${{ vars.SNAPSHOT_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          if [ "${KIND_SMOKE_REMOTE_SNAPSHOT_STORE:-0}" = "1" ]; then
+              bash deploy/kind/fixtures/use-central-snapshot-store.sh
+          else
+              bash deploy/kind/fixtures/install-garage.sh
+              {
+                  echo "SNAPSHOT_STORE_ENDPOINT=http://garage.default.svc.cluster.local:3900"
+                  echo "SNAPSHOT_STORE_BUCKET=sandbawks-snapshots"
+                  echo "SNAPSHOT_STORE_REGION=us-east-1"
+              } >> "$GITHUB_ENV"
+          fi
+
+      # The node DaemonSet runs at the chart-default 1Gi memory limit even
+      # for the GiB-scale bench: the pause path streams the snapshot bundle
+      # to disk (`tar_zstd_checkpoint_files` -> `memory.zst` on the snapshot
+      # cache volume, uploaded via `SnapshotSink::put_part_file`), so node
+      # RAM is flat regardless of payload size (#293). The earlier
+      # `--set node.resources.limits.memory=4Gi` bench override was removed
+      # when that landed — a 1 GiB pause must succeed at the prod default.
+      - name: Helm install (gVisor mode, api + node DaemonSet enabled)
+        run: |
+          # snapshotStore.* come from $GITHUB_ENV (set by the "Provision
+          # snapshot store" step) so this install is identical whether the
+          # backend is the in-cluster garage or the central cluster.
+          helm install sandbawks deploy/helm/sandbawks \
+              --skip-crds \
+              --set api.enabled=true \
+              --set api.replicas=1 \
+              --set node.enabled=true \
+              --set gvisor.enabled=true \
+              --set snapshotStore.existingSecret=sandbawks-snapshot-store \
+              --set snapshotStore.endpoint="${SNAPSHOT_STORE_ENDPOINT}" \
+              --set snapshotStore.bucket="${SNAPSHOT_STORE_BUCKET}" \
+              --set snapshotStore.region="${SNAPSHOT_STORE_REGION}" \
+              --set images.api.repository=ghcr.io/hypotheosis/sandbawks-api \
+              --set images.api.tag=${IMAGE_TAG} \
+              --set images.api.pullPolicy=Never \
+              --set images.controller.repository=ghcr.io/hypotheosis/sandbawks-controller \
+              --set images.controller.tag=${IMAGE_TAG} \
+              --set images.controller.pullPolicy=Never \
+              --set images.node.repository=ghcr.io/hypotheosis/sandbawks-node \
+              --set images.node.tag=${IMAGE_TAG} \
+              --set images.node.pullPolicy=Never \
+              `# Issue #490: the GiB resume bench keeps the generous default` \
+              `# recovery deadlines — staging a ~1 GiB bundle onto a cold node` \
+              `# legitimately needs the room — and the restore staging gate is` \
+              `# shim-side (baked into the kind-node image), so no stage-gate` \
+              `# Helm wiring is needed.` \
+              --set envd.image=ghcr.io/hypotheosis/envd \
+              --set envd.tag=${IMAGE_TAG} \
+              --set envd.pullPolicy=Never \
+              --wait --timeout 300s
+
+      # Seed the SandboxTemplate + matching TeamAPIKey the bench
+      # drives sandboxes against. Cribs the apply-block from
+      # `deploy/kind/fixtures/api-smoke.sh` but **bumps the resource
+      # defaults**: api-smoke writes a 64 KiB sentinel, so its
+      # 64 Mi / 512 Mi / 100m envelope is fine; the bench writes
+      # `payload_mib` × 1 MiB to /tmp and then runsc-checkpoints the
+      # result. At BENCH_PAYLOAD_MIB=256 that's 256 MiB of rootfs
+      # state — half the api-smoke template's ephemeralStorage
+      # budget before envd's own footprint, the snapshot scratch the
+      # node DaemonSet leaves under /tmp during checkpoint, and any
+      # transient overhead the runsc checkpoint stage drops in the
+      # container fs. Tight enough that the first CI run of the
+      # bench hit `phase=Failed` on iteration 1.
+      #
+      # We re-use the `api-smoke-template` name so `BENCH_TEMPLATE_ID`
+      # in the harness's defaults still resolves (no per-environment
+      # name override needed). This template definition only applies
+      # in the bench cluster — the kind-smoke cluster runs its own
+      # `api-smoke.sh` fixture with the smaller envelope, so the two
+      # jobs don't conflict.
+      #
+      # Sized for BENCH_PAYLOAD_MIB=1024 — the issue #185 default, the
+      # spec §13 GiB scale, and (since issue #291) what this CI job now
+      # runs. The same envelope means `just bench` with the issue's
+      # defaults works against a `cluster-up` cluster that picks up these
+      # values (when the user `kubectl apply`s this template instead of
+      # api-smoke.sh's). At 1 GiB workload, 2 Gi ephemeralStorage = 2×
+      # headroom for snapshot scratch.
+      - name: Seed bench fixtures (SandboxTemplate + TeamAPIKey)
+        run: |
+          set -euo pipefail
+          SMOKE_API_KEY="sbk_smoke_smoke_smoke_smoke_smoke"
+          SMOKE_KEY_PREFIX="$(printf '%s' "$SMOKE_API_KEY" | cut -c1-8)"
+          SMOKE_KEY_HASH="sha256:$(printf '%s' "$SMOKE_API_KEY" | openssl dgst -sha256 -r | awk '{print $1}')"
+          kubectl apply -f - <<EOF
+          apiVersion: sandbawks.dev/v1alpha1
+          kind: SandboxTemplate
+          metadata:
+            name: api-smoke-template
+            namespace: default
+          spec:
+            image: docker.io/library/busybox:1.36
+            defaultRuntimeClass: gvisor
+            defaultResources:
+              cpu: "1"
+              memory: "1Gi"
+              ephemeralStorage: "2Gi"
+            defaultTimeoutSeconds: 600
+          ---
+          apiVersion: sandbawks.dev/v1alpha1
+          kind: TeamAPIKey
+          metadata:
+            # Post-#583 the TeamAPIKey lives in the system namespace (the api's
+            # own pod namespace); here that is `default`, the same namespace the
+            # tenant runs in for this single-namespace smoke.
+            name: api-smoke-team-key
+            namespace: default
+          spec:
+            # Tenant namespace this key authorizes (#583, now required) —
+            # identity comes from spec.namespace, not metadata.namespace.
+            namespace: "default"
+            keyPrefix: "${SMOKE_KEY_PREFIX}"
+            keyHash: "${SMOKE_KEY_HASH}"
+            scopes:
+              - "sandboxes:*"
+          EOF
+
+      - name: Port-forward api gateway
+        run: |
+          set -euo pipefail
+          kubectl rollout status deployment/sandbawks-api --timeout=120s
+          kubectl port-forward svc/sandbawks-api 8080:8080 \
+              >/tmp/bench-pf.log 2>&1 &
+          echo $! > /tmp/bench-pf.pid
+          # Same readiness probe the bench's `wait_for_readyz` does,
+          # mirrored here so a wedged port-forward fails this step
+          # with a clear cause rather than the bench's generic
+          # "/readyz never reached".
+          curl -fsS --retry 60 --retry-delay 1 \
+              --retry-connrefused --retry-all-errors \
+              http://localhost:8080/readyz >/dev/null
+
+      # Client-vs-server discriminator (#perf): snapshot per-pod CPU from the
+      # kubelet Summary API (no metrics-server needed) before and after the
+      # bench. Diffed in "Pod CPU during bench" below — sandbawks-node near its
+      # CPU limit ⇒ OUR client is the cap; near-idle while slow ⇒ we're waiting
+      # on garage/disk I/O, not CPU.
+      - name: Snapshot pod CPU (pre-bench)
+        run: |
+          set -euo pipefail
+          NODE="$(kubectl get pod -l app.kubernetes.io/component=node \
+              -o jsonpath='{.items[0].spec.nodeName}')"
+          echo "${NODE}" > /tmp/bench-cpu-node
+          kubectl get --raw "/api/v1/nodes/${NODE}/proxy/stats/summary" \
+              > "${GITHUB_WORKSPACE}/cpu-before.json"
+          echo "pre-bench CPU snapshot captured for node ${NODE}"
+
+      - name: Run pause bench
+        # The bench writes `bench-results.json` to `BENCH_RESULTS_PATH`
+        # and exits non-zero if any configured p95 gate or the
+        # bundle-floor gate (issue #193) is exceeded. `just bench`
+        # is the canonical local-dev entry point, but `just` itself
+        # isn't installed on the runner (same gap the SDK
+        # compat step calls out); we therefore inline the recipe's
+        # body. Keep this in lockstep with the `bench` recipe in the
+        # justfile.
+        run: |
+          set -euo pipefail
+          cd tests/bench
+          cargo run --release
+
+      - name: Pod CPU during bench
+        if: always()
+        run: |
+          set +e
+          NODE="$(cat /tmp/bench-cpu-node 2>/dev/null)"
+          [ -n "${NODE}" ] || NODE="$(kubectl get pod -l app.kubernetes.io/component=node \
+              -o jsonpath='{.items[0].spec.nodeName}')"
+          kubectl get --raw "/api/v1/nodes/${NODE}/proxy/stats/summary" \
+              > "${GITHUB_WORKSPACE}/cpu-after.json" 2>/dev/null
+          node ci/pod-cpu-delta.mjs \
+              "${GITHUB_WORKSPACE}/cpu-before.json" "${GITHUB_WORKSPACE}/cpu-after.json"
+          true
+
+      - name: Stop port-forward
+        if: always()
+        run: |
+          if [ -f /tmp/bench-pf.pid ]; then
+              kill "$(cat /tmp/bench-pf.pid)" 2>/dev/null || true
+          fi
+
+      # Surface the node-side per-phase timing breakdown on EVERY run (the
+      # `Dump diagnostics` step only fires on failure). The node emits one
+      # structured `… phase timings (ms)` line per pause / fetch-verify /
+      # resume — e.g. `phases="checkpoint=4203 compress=1100 upload_memory=19847
+      # …" total_ms=40210` — so a green bench shows exactly where each second
+      # of the 1 GiB pause/resume went without a manual `kubectl logs`. The
+      # `phases=` string and `total_ms=` are awk-able if you want to aggregate
+      # across the 5 iterations.
+      - name: Node snapshot phase timings
+        if: always()
+        run: |
+          set +e
+          echo "=== node per-phase snapshot timings (ms) ==="
+          OUT="${GITHUB_WORKSPACE}/node-phase-timings.log"
+          # Capture the structured timing lines to a file the PR-comment step
+          # below renders into a table, and echo them for the live log too.
+          # `--tail=-1` returns the full log (no line cap); `--prefix=false`
+          # avoids kubectl prepending a `[pod/...]` tag that would break the
+          # downstream field parser. Pin the concrete pod (not `ds/...`) so we
+          # read one complete stream rather than a selector-merged/​truncated one.
+          NODE_POD="$(kubectl get pod -l app.kubernetes.io/component=node \
+              -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
+          echo "node pod: ${NODE_POD:-<none>}"
+          kubectl logs "${NODE_POD}" -c node --tail=-1 2>/dev/null \
+              | grep -E "phase timings \(ms\)|streamed snapshot part to object store" \
+              | tee "${OUT}"
+          # Boundary diagnostics: prove what actually landed in the file the
+          # comment step parses (it diverged once — present but unrendered).
+          echo "--- captured: $(wc -l < "${OUT}" 2>/dev/null || echo 0) lines / $(wc -c < "${OUT}" 2>/dev/null || echo 0) bytes ---"
+          echo "--- first captured line (truncated 600c) ---"
+          head -n1 "${OUT}" 2>/dev/null | cut -c1-600
+          if [ ! -s "${OUT}" ]; then
+              echo "(no timing lines found — node may not have run a pause/resume)"
+          fi
+          true
+
+      - name: Upload bench results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-results.json
+          if-no-files-found: warn
+
+      # Render the bench's per-phase timing table (p50/p95/max vs the configured
+      # p95 targets) into an upserted PR comment. Sibling to the JUnit reporter in
+      # the `smoke` job: without this a reviewer has to download the artifact to
+      # see the resume/pause numbers. `always()` so a perf-gate failure still publishes its timings (the
+      # whole point of the comment is to see *which* phase regressed and by how
+      # much). Best-effort — the script always exits 0, so a comment hiccup never
+      # masks the gate result. Gated to pull_request because a comment needs a PR
+      # (and fork PRs get no token and skip this job anyway).
+      - name: Comment bench timings on PR
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node ci/bench-pr-comment.mjs "${GITHUB_WORKSPACE}/bench-results.json"
+
+      # Render the node-side per-phase breakdown (the `phase timings (ms)`
+      # lines captured above) into its own upserted PR comment. Sibling to the
+      # bench-timings comment: that one shows end-to-end pause/resume p50/p95,
+      # this one shows where each second WITHIN a pause/resume went (checkpoint
+      # vs compress vs S3 upload vs the validate re-download vs decompress) —
+      # the data engineers need to target the right bottleneck. `always()` so a
+      # failed/gated bench still posts what it measured; best-effort (the script
+      # always exits 0).
+      - name: Comment node phase timings on PR
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node ci/node-timings-pr-comment.mjs "${GITHUB_WORKSPACE}/node-phase-timings.log"
+
+      # On failure: dump everything that might explain it. The bench
+      # binary (see `run_iteration` in `tests/bench/src/main.rs`) is
+      # configured to leave the failing sandbox Pod in place rather
+      # than killing it, so the `for pod in $(...)` loop below
+      # actually finds something to `kubectl logs` against.
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          set +e
+
+          echo "=== cluster overview ==="
+          kubectl get all -A
+
+          echo "=== controller ==="
+          kubectl describe deploy/sandbawks-controller
+          kubectl logs deploy/sandbawks-controller --tail=500
+
+          echo "=== api ==="
+          kubectl describe deploy/sandbawks-api
+          kubectl logs deploy/sandbawks-api --tail=500
+
+          echo "=== node DaemonSet ==="
+          kubectl describe ds/sandbawks-node
+          # Bumped tail 200 → 2000: the node DS logs the runsc
+          # checkpoint stderr verbatim, plus the /__state probe
+          # connect/handshake details. 200 lines was burying these
+          # under the boot-time tracing init.
+          kubectl logs ds/sandbawks-node --tail=2000
+
+          echo "=== Sandbox CRs ==="
+          kubectl get sandbox -A -o yaml
+
+          echo "=== SnapshotJob CRs ==="
+          kubectl get snapshotjob -A -o yaml
+
+          echo "=== sandbox Pods (envd containers) ==="
+          # The sandbox Pod's container runs envd, which serves /__state.
+          # When the pause path times out probing envd, envd's own
+          # tracing output is the only place we'll see whether the
+          # GET arrived, how long the handler took, or whether the
+          # listener stalled. The bench leaves failed sandboxes in
+          # place specifically so this loop can find them.
+          SANDBOX_PODS=$(kubectl get pods -l sandbawks.dev/sandbox -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}')
+          if [ -z "$SANDBOX_PODS" ]; then
+              # Fallback: name-prefix match in case the label isn't
+              # being stamped for some chart revision.
+              SANDBOX_PODS=$(kubectl get pods -A -o jsonpath='{range .items[?(@.metadata.name)]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' | grep '/sbx-' || true)
+          fi
+          echo "sandbox pods found:"
+          printf '%s\n' "$SANDBOX_PODS"
+          while IFS= read -r ns_name; do
+              [ -z "$ns_name" ] && continue
+              ns="${ns_name%%/*}"
+              name="${ns_name#*/}"
+              echo "--- describe pod $ns/$name ---"
+              kubectl -n "$ns" describe pod "$name"
+              echo "--- logs pod $ns/$name (envd) ---"
+              kubectl -n "$ns" logs "$name" --tail=2000
+              echo "--- previous logs (if container restarted) ---"
+              kubectl -n "$ns" logs "$name" --previous --tail=500 2>/dev/null
+          done <<< "$SANDBOX_PODS"
+
+          echo "=== recent events ==="
+          kubectl get events -A --sort-by=.lastTimestamp
+
+          echo "=== bench artifacts ==="
+          cat /tmp/bench-pf.log 2>/dev/null
+          cat bench-results.json 2>/dev/null
+          # Re-set -e off explicitly; the step's `set +e` above lets
+          # individual kubectl calls fail without aborting the whole
+          # dump, which is what we want for a best-effort post-mortem.
+          true
+

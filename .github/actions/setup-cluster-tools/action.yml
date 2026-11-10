@@ -1,0 +1,50 @@
+name: setup-cluster-tools
+description: >-
+  Install the pinned kind / kubectl / helm toolchain the cluster jobs
+  (kind-smoke, bench) drive, and free disk space on the hosted runner so a
+  multi-image kind cluster plus BuildKit cache fits.
+
+# Pins are deliberate: bump them together and in one reviewed change, since the
+# smoke fixtures assume these exact CLI behaviours. kind must stay compatible
+# with the kindest/node base in ci/kind-node/Dockerfile.
+inputs:
+  kind-version:
+    description: kind release to install.
+    default: v0.24.0
+  kubectl-version:
+    description: kubectl release to install.
+    default: v1.31.0
+  helm-version:
+    description: Helm release to install.
+    default: v3.16.0
+
+runs:
+  using: composite
+  steps:
+    # ubuntu-latest ships ~14 GiB free; the 2-node kind cluster, four workspace
+    # images and the kind-node tarball need more headroom than that. These
+    # toolchains are never used by sandbawks CI.
+    - name: Free disk space
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        df -h /
+    - name: Install kind, kubectl, helm
+      shell: bash
+      env:
+        KIND_VERSION: ${{ inputs.kind-version }}
+        KUBECTL_VERSION: ${{ inputs.kubectl-version }}
+        HELM_VERSION: ${{ inputs.helm-version }}
+      run: |
+        set -euo pipefail
+        sudo curl -fsSLo /usr/local/bin/kind \
+            "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+        sudo curl -fsSLo /usr/local/bin/kubectl \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+        sudo chmod +x /usr/local/bin/kind /usr/local/bin/kubectl
+        curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin --strip-components=1 linux-amd64/helm
+        kind version
+        kubectl version --client
+        helm version --short

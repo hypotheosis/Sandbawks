@@ -1,0 +1,242 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: snapshotjobs.sandbawks.dev
+spec:
+  group: sandbawks.dev
+  names:
+    categories: []
+    kind: SnapshotJob
+    plural: snapshotjobs
+    shortNames:
+    - sbxsj
+    singular: snapshotjob
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: State
+      type: string
+    - jsonPath: .spec.mode
+      name: Mode
+      type: string
+    - jsonPath: .spec.nodeName
+      name: Node
+      type: string
+    - jsonPath: .spec.sandboxName
+      name: Sandbox
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for SnapshotJobSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Desired state of a single snapshot operation on one node.
+
+              One `SnapshotJob` corresponds to exactly one container on one node. The controller is responsible for picking `node_name` (from `Sandbox.status.assigned_node`) and `container_id` (from `Sandbox.status.pod_uid` or the underlying CRI lookup).
+            properties:
+              containerId:
+                description: CRI container ID for the sandbox's primary container. Populated by the controller from `Sandbox.status.pod_uid` (or a CRI lookup) at job-creation time so the node worker doesn't have to re-resolve it.
+                type: string
+              expectedEnvdSha256:
+                description: |-
+                  For `Resume`/`Stage`, the envd-binary sha256 the controller observed at pause and commits forward — sourced from `Sandbox.status.snapshot_envd_sha256`, which was folded in from the completing Pause job's manifest `envd_sha256`. `None` for `Pause` jobs and for legacy callers / v1 manifests that recorded no envd digest (the node then skips the envd-level cross-check; the restore-side `verify_envd_digest` local-binary check still runs).
+
+                  Issue #278 hardening (follow-up to #270 / #171): mirrors [`Self::expected_sha256`] for the envd dimension so a manifest tampered in storage can't redefine "the expected envd" on the restore node. Without it, a stored manifest that flips both `sha256` and `envd_sha256` to an attacker-controlled binary would pass the envd dimension of the pause-side commit cross-check.
+                nullable: true
+                type: string
+              expectedSha256:
+                description: |-
+                  For `Resume`, the aggregate sha256 the controller expects the fetched manifest to match — sourced from `Sandbox.status.snapshot_sha256`, which was folded in from the completing Pause job's manifest. `None` for `Pause` jobs and for legacy callers that don't commit a fingerprint (the node then skips the manifest-level cross-check; per-part sha256 verification still runs).
+
+                  Issue #171 hardening: closes the manifest-tamper window between pause and resume by binding the URL to a controller-committed fingerprint.
+                nullable: true
+                type: string
+              mode:
+                description: Direction of the operation. See [`SnapshotJobMode`].
+                enum:
+                - Pause
+                - Resume
+                - Stage
+                type: string
+              nodeName:
+                description: '`Node.metadata.name` the per-node worker must run on. The node-side reconciler filters its watch by this field.'
+                type: string
+              sandboxName:
+                description: Name of the `Sandbox` CR this job operates on (same namespace).
+                type: string
+              snapshotRef:
+                description: For `Resume`, the snapshot URL to restore from (typically `s3://...`). `None` for `Pause` jobs.
+                nullable: true
+                type: string
+              targetPath:
+                description: |-
+                  For [`SnapshotJobMode::Stage`] resume jobs, the *deterministic* local filesystem path the node worker must materialize the snapshot's parts at — `<stagingRoot>/<sandbox-id>/restore` (epic #484, scheduler-placed restore).
+
+                  Under the new resume ordering the controller creates the restore Pod first (unpinned) with its `io.sandbawks/restore-image-path` annotation already set to this path, then dispatches the `Stage` job *targeting the same path* once the scheduler has placed the Pod. Pinning the path here — rather than letting the node pick a timestamped dir and reporting it back — is what lets the restore Pod's annotation be set before the snapshot exists.
+
+                  `None` for `Pause` jobs and for legacy `Stage` callers that let the node choose the path (it then reports the chosen path back in [`SnapshotJobStatus::local_path`] as before).
+                nullable: true
+                type: string
+            required:
+            - containerId
+            - mode
+            - nodeName
+            - sandboxName
+            type: object
+          status:
+            description: Observed state of a `SnapshotJob`, written by the per-node worker.
+            nullable: true
+            properties:
+              completedAt:
+                description: RFC 3339 timestamp the worker entered a terminal phase (`Complete` or `Failed`).
+                nullable: true
+                type: string
+              localPath:
+                description: On `Complete` for a [`SnapshotJobMode::Stage`] job, the local filesystem path where the snapshot's parts were materialized (the return value of [`crate::RuntimeAdapter::stage_snapshot`]). A downstream consumer — e.g. the `containerd-shim` performing a start-time `runsc restore` — reads from this path. `None` while in flight and for `Pause`/`Resume` jobs.
+                nullable: true
+                type: string
+              manifest:
+                description: On `Complete` for a `Pause` job, the manifest the controller folds into `Sandbox.status.snapshot_ref`. `None` while in flight, and for `Resume` jobs.
+                nullable: true
+                properties:
+                  createdAt:
+                    description: RFC 3339 timestamp.
+                    type: string
+                  envdCaptured:
+                    default: false
+                    description: |-
+                      Whether the checkpointed `envd` was running from the relocate target (the `/var/tmp/envd/run/envd` rootfs path) rather than the node-staged host binary at pause time (epic #466, capture-in-checkpoint).
+
+                      Under the relocation model (#467/#468) a cold-started sandbox copies `envd` onto a plain directory in its rootfs and re-execs it there. Under the cluster's `--overlay2=root:self` the rootfs is the sandbox-internal overlay-tmpfs, so those code pages live in the checkpoint's `pages.img`. A memory-only `runsc restore` rebuilds them from the snapshot itself — the restore node's host `envd` binary is no longer the backing store for the workload's mappings — so the snapshot survives a later host-side `envd` upgrade that would otherwise re-fault a hostPath-bound binary's pages and corrupt the restore.
+
+                      `true` tells the restore path it is safe to *skip* the #270 host-binary determinism comparison ([`crate::RuntimeAdapter`] impls' `verify_envd_digest`): the host is irrelevant, and the per-part sha256 gate still protects the snapshot bytes. `false`/absent preserves the fail-closed host comparison for legacy (pre-relocation) snapshots, which remain mmap-backed by the staged host binary.
+
+                      `#[serde(default)]` so a v1/legacy manifest written before this field existed deserializes to `false` and keeps today's fail-closed guard.
+                    type: boolean
+                  envdSha256:
+                    default: ''
+                    description: |-
+                      Lower-case-hex SHA-256 of the node-staged `envd` binary the paused sandbox was executing (issue #270).
+
+                      Under the node-staging delivery model (issue #265), the workload container execs the cluster-wide `envd` binary mounted read-only from the node, so its executable pages are mmap-backed by that on-disk file. A memory-only `runsc restore` reconnects those mappings, so the binary the *restore* node stages must be byte-identical to the one the *pause* node checkpointed against; otherwise the restored process's code pages mismatch the file and the restore corrupts. Recording the digest here makes the resume path self-describing: the restore node fails closed when its staged binary has drifted (a mutable `envd.image` tag re-pushed between pause and resume).
+
+                      Empty for v1 manifests and for a pause that could not read the staged binary (e.g. a node worker without the envd mount); the restore path then warns and falls back to per-part sha256 verification only, rather than hard-failing. `#[serde(default)]` so a manifest written before this field existed deserializes to the empty string.
+                    type: string
+                  parts:
+                    default: []
+                    description: Individual parts of the snapshot bundle. Defaults to empty for backwards-compat deserialization of v1 single-sha256 manifests.
+                    items:
+                      description: |-
+                        One uploaded chunk of a snapshot.
+
+                        `name` is the part's filename inside the snapshot bundle (e.g. `"memory.zst"`); `sha256` is the lower-case-hex SHA-256 of the *uncompressed* payload bytes; `size_bytes` is the on-the-wire length the sink wrote.
+
+                        The pair `(name, sha256)` uniquely identifies a part — two parts with the same content hash are interchangeable, which lets the Plan 05 T6 S3 sink short-circuit re-uploads of identical chunks across pause/resume cycles.
+                      properties:
+                        name:
+                          description: Filename of the part inside the snapshot bundle.
+                          type: string
+                        sha256:
+                          description: Lower-case-hex SHA-256 of the part's bytes.
+                          type: string
+                        sizeBytes:
+                          description: On-the-wire (compressed) byte length the sink reported writing.
+                          format: uint64
+                          minimum: 0.0
+                          type: integer
+                        uncompressedBytes:
+                          description: |-
+                            Uncompressed payload size in bytes, when the producer knows it.
+
+                            `size_bytes` is the *compressed* length. For the `memory.zst` part that under-counts the RAM working set an in-process `runsc restore` faults in — zstd ratios of 3-5x on memory pages are common, so a 2 GiB `memory.zst` can decompress to an ~8 GiB `pages.img` working set (#243). When the producer knows the pre-compression total (gVisor `pause` sums the `*.img` file sizes before zstd), it records it here so the resume-path memory headroom gate ([`crate::runtime::RuntimeAdapter`] impls' `enforce_headroom`) can admit on the true working set rather than the compressed proxy.
+
+                            `Option` + `#[serde(default)]` keeps v1/v2 manifests backward-compatible: absent (the only value an older pauser ever wrote) → the gate falls back to `size_bytes`, preserving pre-#243 behavior. `skip_serializing_if` keeps the wire form of parts that don't carry the figure (rootfs delta, envd state) byte-identical to the v2 schema.
+                          format: uint64
+                          minimum: 0.0
+                          nullable: true
+                          type: integer
+                      required:
+                      - name
+                      - sha256
+                      - sizeBytes
+                      type: object
+                    type: array
+                  runscVersion:
+                    default: ''
+                    description: |-
+                      Host `runsc` (gVisor) release token (e.g. `release-20260525.0`) the checkpoint in this snapshot was taken against (#545, Capability B).
+
+                      gVisor checkpoint/restore requires the *exact* same runsc build on the pausing and restoring node — a mismatch makes `runsc restore` fail with `runsc version does not match across checkpoint restore` and crash-loops the restore Pod's sandbox (`FailedCreatePodSandBox`). Recording the pausing node's runsc release here makes the snapshot self-describing: the controller folds it into `Sandbox.status.snapshotRuntimeVersion` and constrains the restore Pod's `nodeAffinity` to nodes advertising the matching [`crate::RUNSC_VERSION_LABEL`], turning a fatal mismatch into a bounded, diagnosable `Pending`.
+
+                      Empty for v1 manifests and for a pause whose node could not read its host runsc version (an unparseable/absent binary); the restore gate then degrades to envd-staged affinity only — no worse than today's ungated placement — rather than pinning the restore to nowhere. `#[serde(default)]` so a manifest written before this field existed deserializes to the empty string.
+                    type: string
+                  runtimeClass:
+                    description: Runtime that produced the snapshot (`gvisor`, `kata-fc`, `runc-criu`).
+                    type: string
+                  sandboxId:
+                    description: The Sandbox the snapshot belongs to (the CR `metadata.name`).
+                    type: string
+                  sha256:
+                    description: Aggregate SHA-256 over the sorted part hashes (see [`crate::snapshot::aggregate_sha256`]). Empty when `parts` is empty.
+                    type: string
+                  snapshotRef:
+                    default: ''
+                    description: Storage URL of the manifest (e.g. `s3://bucket/key`). Defaults to the empty string for backwards-compat deserialization.
+                    type: string
+                  templateImage:
+                    default: ''
+                    description: |-
+                      Workload image ref/digest (`SandboxTemplate.spec.image`) the snapshotted sandbox was checkpointed from (issue #416). The compatibility-critical half of [`Self::template_ref`]: a memory-image restore reconnects the workload's code-page mappings, so a clone whose template image differs from the snapshot's would restore corrupt. The controller's clone gate compares this against the new sandbox's resolved template image.
+
+                      Empty for legacy snapshots (warn-only image gate). `#[serde(default)]` so a manifest written before this field existed deserializes to the empty string.
+                    type: string
+                  templateRef:
+                    default: ''
+                    description: |-
+                      Name of the `SandboxTemplate` the snapshotted sandbox was created from (issue #416). Recorded so a *clone-from-snapshot* restore can validate the source against the new sandbox's template before staging.
+
+                      Empty for snapshots written before this field existed; the clone path's template gate then degrades to warn-only rather than hard-failing. `#[serde(default)]` so a legacy manifest deserializes to the empty string.
+                    type: string
+                required:
+                - createdAt
+                - runtimeClass
+                - sandboxId
+                - sha256
+                type: object
+              message:
+                description: Human-readable diagnostic message — populated on `Failed` with the underlying error, or on long-running phases to surface progress (e.g. "uploaded 3/12 chunks").
+                nullable: true
+                type: string
+              phase:
+                default: Pending
+                description: Current phase. See [`SnapshotJobPhase`].
+                enum:
+                - Pending
+                - Checkpointing
+                - Uploading
+                - Validating
+                - Restoring
+                - Complete
+                - Failed
+                type: string
+              startedAt:
+                description: RFC 3339 timestamp the worker first picked the job up.
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: SnapshotJob
+        type: object
+    selectableFields:
+    - jsonPath: .spec.nodeName
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -1,0 +1,23 @@
+[project]
+name = "sandbawks-e2b-sdk-compat"
+version = "0.0.0"
+description = "E2B Python SDK compatibility harness for sandbawks."
+requires-python = ">=3.11"
+dependencies = [
+    "e2b>=2.61,<3",
+    "httpx>=0.27,<1",
+    "pytest>=8,<9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "lifecycle: sandbox create / pause / connect / kill",
+    "commands: command execution and streaming",
+    "files: filesystem read / write / list / stat / remove / move / makedir / watch",
+    "events: SSE event stream",
+    "compound: pause -> resume -> exec, write -> list -> read -> remove",
+    "agentic: multi-turn stateful agent execution, including pause/resume boundary",
+    "skipped_until_plan: SDK methods deferred to a later sub-plan",
+]

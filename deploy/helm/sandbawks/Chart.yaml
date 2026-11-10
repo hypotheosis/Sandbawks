@@ -1,0 +1,14 @@
+apiVersion: v2
+name: sandbawks
+description: E2B-compatible Kubernetes sandbox controller
+type: application
+version: 0.1.29
+appVersion: "0.1.29"
+home: https://github.com/hypotheosis/sandbawks
+sources:
+  - https://github.com/hypotheosis/sandbawks
+keywords:
+  - sandbox
+  - e2b
+  - ai
+  - agents

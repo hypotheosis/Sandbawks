@@ -1,0 +1,21 @@
+# Keep the build context small so `docker build` is fast and reproducible.
+# Anything excluded here is invisible to every stage of the Dockerfile.
+
+# Build artifacts: rebuilt inside the container anyway.
+target/
+
+# Version control / local tooling state.
+.git/
+.gitignore
+
+# Test snapshots aren't needed to compile the binary.
+**/*.snap
+
+# Docs and changelog are author-facing; the binary doesn't need them.
+changelog/
+docs/
+
+# Deployment manifests are consumed by Helm/kind out-of-band, not by the
+# controller binary itself.
+deploy/helm/
+deploy/kind/

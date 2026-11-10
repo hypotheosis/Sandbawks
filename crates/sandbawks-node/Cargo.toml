@@ -1,0 +1,113 @@
+[package]
+name = "sandbawks-node"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Per-node DaemonSet that drives sandbox pause/resume via runsc checkpoint + S3-streamed snapshots."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "sandbawks-node"
+path = "src/bin/sandbawks-node.rs"
+
+# T1 landed only the scaffold; T6 pulls in `rust-s3` + the streaming
+# helpers needed for chunked uploads. T7 adds `containerd-client` +
+# `zstd` + `tar` for the `GvisorAdapter::pause` mechanics; T9 pulls
+# in `kube` runtime pieces. They're already declared in the workspace
+# `[dependencies]` so subsequent task PRs are pure additions to this
+# manifest. The envd `/__state` probe is hand-rolled HTTP/1.1 over
+# `tokio::net::TcpStream` (not `reqwest`) so it can `SO_LINGER(0)`
+# the connection and abort with TCP RST — see
+# `gvisor::HttpEnvdProbe`'s docs for why.
+[dependencies]
+sandbawks-types = { path = "../sandbawks-types" }
+sandbawks-observability = { path = "../sandbawks-observability" }
+# OTel metrics API: `snapshotjob_metrics` records SnapshotJob duration/executions
+# off the global meter `init_telemetry` registers (the API only, not the SDK).
+opentelemetry = { workspace = true }
+
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# T6 additions: S3 client + streaming + hashing + (de)serialization of
+# the per-part chunk index.
+rust-s3 = { workspace = true }
+# Azure Blob Storage snapshot backend (#585). See `src/azure_blob.rs` (Task 3).
+azure_core = { workspace = true }
+azure_storage = { workspace = true }
+azure_storage_blobs = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# T7 additions: `runsc checkpoint` work-dir staging + tar/zstd of the
+# memory image + containerd lookup for the sandbox container ID and
+# rootfs snapshotter diff. (The envd `/__state` probe is hand-rolled
+# over `tokio::net::TcpStream`, no HTTP client crate needed.)
+containerd-client = { workspace = true }
+zstd = { workspace = true }
+tar = { workspace = true }
+# `socket2` is used by `gvisor::HttpEnvdProbe` to call
+# `set_linger(Some(Duration::ZERO))` on the probe's TCP socket so the
+# close path sends a RST instead of a FIN — the only way to leave the
+# sandbox-side endpoint in CLOSED before `runsc checkpoint` fires.
+socket2 = { workspace = true }
+# `chrono` produces the RFC 3339 work-dir timestamp + manifest
+# `created_at`. The workspace dep already builds without
+# `default-features` so we inherit the static-friendly profile.
+chrono = { workspace = true }
+
+# T9 additions: the `SnapshotJob` reconciler watches CRs via kube-rs's
+# `Controller`, filtering the watch by `spec.nodeName=$NODE_NAME` so
+# each Pod only consumes the jobs targeted at its node.
+kube = { workspace = true }
+# `tokio::signal` is provided by the `signal` feature of the `tokio`
+# crate already pulled in above (workspace turns `full` on); no extra
+# dep needed for the binary's SIGINT/SIGTERM handler.
+
+# T15 live-impl: `ContainerdClient::resolve_pod` reads Kubernetes Pods
+# on the local node to translate a Pod UID into the containerd
+# container ID + pod IP + sandbox label. `tonic` is pulled in
+# transitively by `containerd-client` but the `with_namespace!` macro
+# expands bare `Request::new(...)`, so we re-import it at the call site.
+k8s-openapi = { workspace = true }
+tonic = { workspace = true }
+
+# #238 resource-headroom guard: `nix::sys::statvfs` reads the staging
+# filesystem's available blocks before staging/restoring a snapshot.
+# The workspace `nix` already enables the `fs` feature `statvfs` lives
+# behind (envd uses the same dep), so this is a pure manifest addition.
+# Available memory is read from `/proc/meminfo` with std, no extra dep.
+nix = { workspace = true }
+
+[dev-dependencies]
+# T7 tests construct `FakeSnapshotStore` to verify the pause workflow
+# uploads correct sha256 + bytes without standing up a real S3 bucket.
+sandbawks-types = { path = "../sandbawks-types", features = ["testing"] }
+tempfile = { workspace = true }
+# Property-based testing for the chunked S3 round-trip (Plan 05 T6).
+# Aliased to `hegel` per the workspace declaration — the crate's
+# proc-macros embed the path `hegel::` in their expansion.
+hegel = { workspace = true }
+# #272: `tests/node_label.rs` hands `kube::Client` a mocked tower service
+# to assert the exact PATCH `advertise_envd_staged` issues against the
+# Node, without a real apiserver. Mirrors `sandbawks-controller`'s
+# `tests/pod_adapter.rs`.
+tower-test = "0.4"
+http = "1"
+# #282: `tests/node_label.rs` drives `run_envd_staged_reconciler` under
+# `#[tokio::test(start_paused = true)]` + `tokio::time::advance`, which
+# need tokio's `test-util` feature (the workspace dep doesn't enable it).
+# Mirrors `sandbawks-api`'s dev-dep override.
+tokio = { workspace = true, features = ["test-util"] }

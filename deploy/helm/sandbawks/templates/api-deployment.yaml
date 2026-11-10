@@ -1,0 +1,82 @@
+{{- if .Values.api.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbawks-api
+  labels: {{- include "sandbawks.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.api.replicas }}
+  selector:
+    matchLabels:
+      {{- include "sandbawks.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        {{- include "sandbawks.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: api
+    spec:
+      serviceAccountName: sandbawks-api
+      containers:
+        - name: api
+          image: "{{ .Values.images.api.repository }}:{{ .Values.images.api.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.images.api.pullPolicy }}
+          env:
+            # Falls back to the release namespace when unset, so the api
+            # reads/writes Sandbox CRs in the same namespace the controller
+            # watches (SANDBAWKS_NAMESPACE = its own pod namespace). A static
+            # default here would silently split the two whenever the chart is
+            # installed outside `default`, and Sandboxes would never reconcile.
+            - name: SANDBAWKS_DEFAULT_NAMESPACE
+              value: {{ .Values.api.defaultNamespace | default .Release.Namespace | quote }}
+            # The system namespace where TeamAPIKeys live (out of tenant reach,
+            # #583): the api lists keys here, not cluster-wide, and resolves the
+            # tenant namespace from each key's spec.namespace. This is the api
+            # Pod's own (release) namespace, injected via the downward API.
+            - name: SANDBAWKS_SYSTEM_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # IPv6 wildcard so kubelet probes reach the server on
+            # dual-stack / IPv6-primary clusters (the Pod IP is IPv6 there
+            # and an IPv4-only `0.0.0.0` bind refuses the probe). `[::]`
+            # also accepts IPv4-mapped clients on Linux.
+            - name: SANDBAWKS_API_LISTEN
+              value: "[::]:8080"
+            {{- with .Values.api.sandboxDomain }}
+            # Wildcard base domain for E2B hostname-based sandbox selection
+            # (issue #364). When set, the gateway resolves the target sandbox
+            # from a `{port}-{sandbox_id}.{domain}` request Host, matching the
+            # official E2B SDKs. Pair with a `*.{domain}` Ingress host below.
+            # Unset (the default) keeps the gateway header-only.
+            - name: SANDBAWKS_SANDBOX_DOMAIN
+              value: {{ . | quote }}
+            {{- end }}
+            - name: SANDBAWKS_ENVD_SILENT_PARK_MAX_SECS
+              value: {{ .Values.api.envdSilentParkMaxSecs | quote }}
+            - name: SANDBAWKS_ENVD_SLEEP_HONOR_MAX_SECS
+              value: {{ .Values.api.envdSleepHonorMaxSecs | quote }}
+            - name: SANDBAWKS_SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sandbawks.signingSecretName" . }}
+                  key: signing-secret
+            {{- include "sandbawks.observabilityEnv" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+{{- end }}

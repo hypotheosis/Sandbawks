@@ -1,0 +1,93 @@
+[package]
+name = "sandbawks-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "E2B-compatible HTTP/WS API gateway for the sandbawks Kubernetes sandbox controller."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "sandbawks-api"
+path = "src/bin/sandbawks-api.rs"
+
+[features]
+# Production builds carry no extra surface. The `test-util` feature
+# exposes `AppState::for_test` + the `FakeSandboxOps` impl so external
+# integration test crates (or downstream consumers' tests) can drive
+# the router without a live kube apiserver.
+default = []
+test-util = []
+
+[dependencies]
+sandbawks-types = { path = "../sandbawks-types" }
+envd = { path = "../envd" }
+# Shared OpenTelemetry bootstrap (issue #295 Phase 1). Owns the
+# `tracing` → OTel bridge + RAII shutdown guard; `main` calls
+# `init_telemetry` in place of the old local `init_tracing`.
+sandbawks-observability = { path = "../sandbawks-observability" }
+# OTel metrics API: the `http_metrics` middleware records HTTP-server
+# instruments off the global meter `init_telemetry` registers. Only the API
+# surface is used (no SDK) — the bootstrap crate owns the provider wiring.
+opentelemetry = { workspace = true }
+
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+tracing = { workspace = true }
+
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+tonic = { workspace = true }
+prost = { workspace = true }
+# `prost-types` is pulled in directly so the filesystem-metadata
+# handlers in `routes::files` can name `prost_types::Timestamp` when
+# projecting envd's `EntryInfo.modified_time` into the public DTO.
+# envd's generated code references the same type as
+# `::prost_types::Timestamp`, but Rust requires the crate to be in
+# *our* dependency graph too in order to name it in a function
+# signature.
+prost-types = { workspace = true }
+dashmap = { workspace = true }
+
+hmac = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+base64 = { workspace = true }
+mime = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+# `test-util` enables `#[tokio::test(start_paused = true)]`, the paused
+# virtual clock the `envd_cache` TTL tests drive. The workspace tokio
+# omits it so production builds stay lean; cargo unions this in for test
+# builds only.
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }
+hegel = { workspace = true }
+http-body-util = "0.1"
+# Real-recorder assertions for the warm-claim metrics (#288): the SDK's
+# `InMemoryMetricExporter` lets `tests/warm_claim_metrics.rs` install a live
+# meter provider and scrape the emitted points, proving the instruments fire
+# on a real recorder (not just the no-op meter the unit tests exercise).
+opentelemetry_sdk = { workspace = true, features = ["testing"] }

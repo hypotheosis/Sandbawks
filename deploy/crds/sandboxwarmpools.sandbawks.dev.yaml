@@ -1,0 +1,132 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: sandboxwarmpools.sandbawks.dev
+spec:
+  group: sandbawks.dev
+  names:
+    categories: []
+    kind: SandboxWarmPool
+    plural: sandboxwarmpools
+    shortNames:
+    - sbxwp
+    singular: sandboxwarmpool
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.templateRef
+      name: Template
+      type: string
+    - jsonPath: .spec.minReady
+      name: Min
+      type: integer
+    - jsonPath: .spec.maxReady
+      name: Max
+      type: integer
+    - jsonPath: .status.ready
+      name: Ready
+      type: integer
+    - jsonPath: .status.failed
+      name: Failed
+      type: integer
+    - jsonPath: .status.total
+      name: Total
+      type: integer
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for SandboxWarmPoolSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Pool of `Running`, ready-to-claim sandboxes for instant cold-start handoff.
+
+              The controller keeps `status.ready` between `spec.min_ready` and `spec.max_ready` by booting fresh sandboxes from `spec.template_ref` and holding them `Running`. A claim is a control-plane reassignment — the gateway re-owns a live member and hands back its `envd` address — so there is no pod creation or restore on the claim path.
+            properties:
+              maxReady:
+                description: Upper bound on `status.ready`. The controller will not warm additional sandboxes once the count reaches this ceiling.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              minReady:
+                description: Lower bound on `status.ready`. The controller will create new sandboxes until the warm count reaches this floor.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              templateRef:
+                description: Name of a `SandboxTemplate` in the same namespace whose image, resources, and envd build define the pre-paused sandboxes.
+                type: string
+            required:
+            - maxReady
+            - minReady
+            - templateRef
+            type: object
+          status:
+            description: Observed state of a `SandboxWarmPool`, written by the controller.
+            nullable: true
+            properties:
+              backoffCount:
+                default: 0
+                description: 'Number of times the breaker has tripped (or re-tripped after a failed probe) in the current open episode — the exponent driving the capped exponential backoff window (issue #615). Reset to `0` when the breaker closes. A probe that re-trips increments it so the window grows.'
+                format: uint32
+                minimum: 0.0
+                type: integer
+              backoffUntil:
+                description: 'RFC 3339 timestamp until which the breaker suppresses minting (issue #615). While `now < backoff_until` the pool mints zero members; once it elapses a single **probe** mint is allowed. `None` when the breaker is closed. Stored as an RFC 3339 string to match the Sandbox reconcile''s sibling timestamp convention.'
+                nullable: true
+                type: string
+              consecutiveMintFailures:
+                default: 0
+                description: |-
+                  Running count of consecutive mint failures the breaker has observed (issue #615).
+
+                  Incremented each reconcile that reaps one or more `Failed`/`Terminating` members (a "mint failure" — a member that was minted and then folded to a terminal phase), and reset to `0` on a reconcile that reaps none. When it reaches the breaker's trip threshold the pool stops minting and enters backoff. Persisted in `status` because the warm-pool reconcile is otherwise stateless across passes — the breaker's memory lives here, the same way the Sandbox reconcile anchors its retry budgets in `SandboxStatus`.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              degraded:
+                default: false
+                description: |-
+                  Whether the mint-failure circuit breaker is currently tripped — the pool is backing off and minting zero new members (issue #615).
+
+                  Surfaced so a pool stuck below `minReady` because the breaker is open is not silently mistaken for a healthy pool that merely lost members. Pairs with [`Self::degraded_reason`] for the human-readable cause and [`Self::backoff_until`] for when the next probe mint is allowed.
+                type: boolean
+              degradedReason:
+                description: 'Human-readable reason the breaker tripped — the dominant failure message from the reaped members (issue #615). `None` while the breaker is closed.'
+                nullable: true
+                type: string
+              failed:
+                default: 0
+                description: 'Members observed this reconcile in a terminal `Failed`/`Terminating` phase. The reconciler reaps (deletes) these every pass, so a sustained non-zero value flags a pod-create failure storm — e.g. a transient admission-webhook outage — churning the pool. Surfacing it makes the condition visible in `kubectl get`/`describe`, which previously reported only `ready` (issue #457).'
+                format: uint32
+                minimum: 0.0
+                type: integer
+              members:
+                description: Names of the `Running` members currently ready to claim.
+                items:
+                  type: string
+                type: array
+              ready:
+                default: 0
+                description: Number of sandboxes in the pool currently `Running` and ready for handoff.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              total:
+                default: 0
+                description: |-
+                  Total members observed this reconcile across every phase (`ready` + in-flight + reclaimed/evicted + `failed`) — the true count of warm `Sandbox` CRs the pool owns. `maxReady` bounds only `ready`, so surfacing the total is what makes runaway CR growth visible (issue #457).
+
+                  Unlike `ready`, this field has **no ceiling**: `spec.maxReady` does not bound it, and that is intentional — `total` is the leak indicator, so a spike above `maxReady` is the signal, not an anomaly to clamp. A dashboard should plot it raw, not assume `total <= maxReady`.
+                format: uint32
+                minimum: 0.0
+                type: integer
+            type: object
+        required:
+        - spec
+        title: SandboxWarmPool
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -1,0 +1,67 @@
+name: kind-node image
+
+# Build + publish ghcr.io/<owner>/sandbawks-kind-node — the custom kind node
+# image (issue #147) layered atop `kindest/node:v1.31.0` with a pre-baked
+# `runsc`, the containerd runtime handler config, and the compiled
+# `containerd-shim-sandbawks-v1`. Consumed by `deploy/kind/cluster.yaml` for
+# local gVisor clusters (`just cluster-up`).
+#
+# CI does not depend on this image: kind-smoke.yaml builds the same Dockerfile
+# from the PR's own source whenever its cache key (ci/kind-node/**, shim/**)
+# misses, so a PR is never smoke-tested against a stale published image.
+#
+# Triggers:
+#   - workflow_dispatch: cut an image on demand (e.g. after bumping
+#     `GVISOR_RELEASE` in ci/kind-node/Dockerfile).
+#   - push on main limited to the image's inputs + this workflow, so unrelated
+#     commits don't burn a build. `shim/**` is included because the image
+#     embeds the compiled shim.
+#
+# Tags: `<short-sha>` (immutable), `latest` (default branch), `YYYY.MM` on
+# scheduled runs, and `<semver>` on version tags.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'ci/kind-node/**'
+      - 'shim/**'
+      - '.github/workflows/kind-node-image.yaml'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/sandbawks-kind-node
+          tags: |
+            type=sha,prefix=,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=schedule,pattern={{date 'YYYY.MM'}}
+            type=semver,pattern={{version}}
+      - uses: docker/build-push-action@v6
+        with:
+          # Build context is the repo root, not `ci/kind-node/`, because the
+          # Dockerfile COPYs `shim/` and bind-mounts `ci/kind-node/*.toml` by
+          # repo-relative path.
+          context: .
+          file: ci/kind-node/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=kind-node
+          cache-to: type=gha,mode=max,scope=kind-node

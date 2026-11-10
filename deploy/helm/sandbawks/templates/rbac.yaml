@@ -1,0 +1,205 @@
+{{- if .Values.controller.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sandbawks-controller
+  labels: {{- include "sandbawks.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["sandbawks.dev"]
+    resources: ["sandboxes", "sandboxtemplates", "sandboxwarmpools", "teamapikeys"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["sandbawks.dev"]
+    resources: ["sandboxes/status", "sandboxwarmpools/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["sandbawks.dev"]
+    resources: ["snapshotjobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["sandbawks.dev"]
+    resources: ["snapshotjobs/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps", "secrets", "events"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # filesystem-mode persistence (epic #603): the controller provisions one
+  # Sandbox-owned PersistentVolumeClaim per `volumeClaimTemplates` entry before
+  # creating the Pod, GETs them on the idempotent 409 retry, and — with PVC
+  # retention enabled (#608) — the cascade delete flows through the Sandbox's
+  # ownerReferences. Without this rule a `persistenceMode: filesystem` sandbox
+  # fails at PVC creation with a forbidden error.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  {{- if .Values.controller.fqdnEgress.enabled }}
+  # FQDN egress enforcement (issue #541): when enabled, the controller also
+  # materializes a per-sandbox Cilium `toFQDNs` CiliumNetworkPolicy so a
+  # DNS-name `egressAllow` entry authorizes the resolved L3 connection. The CRD
+  # ships with Cilium itself; this rule grants the controller write access to it.
+  # Gated so non-Cilium clusters don't reference a CRD/apiGroup they lack.
+  - apiGroups: ["cilium.io"]
+    resources: ["ciliumnetworkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  {{- end }}
+  # Leader election (issue #436): the controller GETs, CREATEs, and renews
+  # (UPDATEs) a single coordination.k8s.io/v1 Lease to elect one active
+  # reconciler among replicas. Only those three verbs are exercised — no
+  # list/watch/patch/delete — so the rule is scoped to them. The Lease is
+  # namespaced and only ever accessed in the controller's own namespace; it
+  # rides in this ClusterRole purely to sit alongside the controller's existing
+  # cluster-scoped rules rather than be split into a separate namespaced Role.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+  # Issue #529: the controller publishes phase-transition Events via
+  # kube-runtime's Recorder, which uses the events.k8s.io/v1 API (not core
+  # v1/Event). The core `""` events rule above does NOT cover this group.
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create"]
+  # Tenant RBAC provisioning (#583): the tenant_rbac reconciler server-side-
+  # applies a `sandbawks-tenant` ServiceAccount + Role + RoleBinding into each
+  # tenant namespace named by a TeamAPIKey's spec.namespace, so the api can
+  # impersonate that SA. Creating the RoleBinding passes the apiserver
+  # privilege-escalation guard WITHOUT `bind`/`escalate` because the tenant
+  # Role's verbs are a subset of this ClusterRole's existing cluster-wide
+  # sandbox verbs — keep the tenant Role no broader than the rules above.
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sandbawks-controller
+  labels: {{- include "sandbawks.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sandbawks-controller
+subjects:
+  - kind: ServiceAccount
+    name: sandbawks-controller
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if .Values.api.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sandbawks-api
+  labels: {{- include "sandbawks.labels" . | nindent 4 }}
+rules:
+  # Auth lookup (#583): keys live in the system namespace; the gateway lists
+  # them there under its own SA, before any impersonation.
+  - apiGroups: ["sandbawks.dev"]
+    resources: ["teamapikeys"]
+    verbs: ["get", "list", "watch"]
+  # NON-tenant Sandbox reads under the gateway's own SA (#442): the envd-proxy
+  # cache watches Sandboxes in the gateway default namespace, which carries no
+  # team identity to impersonate. Tenant CRUD (create/delete/patch/update) is
+  # deliberately NOT here — it now flows through per-namespace tenant-SA
+  # impersonation, so the apiserver enforces isolation instead of this SA.
+  - apiGroups: ["sandbawks.dev"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "watch"]
+  # Idle-timeout activity stamping (issue #481): `stamp_activity` patches
+  # `status.lastActivityTimestamp` on the no-team-identity proxy hot path, so it
+  # runs under the gateway's own SA (it cannot impersonate) and needs the
+  # `/status` subresource. Status-only — not a tenant-isolation hole (#442).
+  - apiGroups: ["sandbawks.dev"]
+    resources: ["sandboxes/status"]
+    verbs: ["get", "patch", "update"]
+  # Event streaming (routes::events) reads Events in the team namespace under
+  # the gateway's own SA. The tenant Role (#583) does not grant `events`, so
+  # this read is not yet impersonated; it is read-only and a documented
+  # follow-up to fold into impersonation once the tenant Role gains `events`.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  # Impersonate the per-namespace tenant SA so the apiserver enforces tenant
+  # isolation for all tenant CRUD (#442). Granted cluster-wide on
+  # `serviceaccounts` — the minimum to impersonate a SA in any tenant
+  # namespace. The tenant RoleBinding (#583) is what actually confines the
+  # resulting access to one namespace, so this grant is broad but powerless on
+  # its own (it authorizes assuming an identity, not acting as one).
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["impersonate"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sandbawks-api
+  labels: {{- include "sandbawks.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sandbawks-api
+subjects:
+  - kind: ServiceAccount
+    name: sandbawks-api
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if .Values.node.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sandbawks-node
+  labels: {{- include "sandbawks.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["sandbawks.dev"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["sandbawks.dev"]
+    resources: ["sandboxes/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["sandbawks.dev"]
+    resources: ["snapshotjobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["sandbawks.dev"]
+    resources: ["snapshotjobs/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # #272: the node binary labels its own Node `sandbawks.dev/envd-staged`
+  # after `stage-envd` completes, so the controller's nodeAffinity gate
+  # lets sandbox Pods schedule here. Labeling is a `patch` on the core
+  # `nodes` resource — labels live in `metadata`, not the status
+  # subresource — alongside the get/list/watch the reconcile loop uses.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch"]
+  {{- if .Values.node.runscUpgrade.enabled }}
+  # #550: the privileged fleet-upgrader serializes the restart-bearing host
+  # install to ONE node at a time via a single cluster-wide
+  # coordination.k8s.io/v1 Lease — each node GETs it, then CREATEs/UPDATEs to
+  # claim it and DELETEs to release it on convergence. Scoped to exactly those
+  # verbs, and gated so a cluster not using the upgrader grants no extra access.
+  # The Lease is namespaced (the node's own namespace); it rides this ClusterRole
+  # alongside the node's existing cluster-scoped rules.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update", "delete"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sandbawks-node
+  labels: {{- include "sandbawks.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sandbawks-node
+subjects:
+  - kind: ServiceAccount
+    name: sandbawks-node
+    namespace: {{ .Release.Namespace }}
+{{- end }}

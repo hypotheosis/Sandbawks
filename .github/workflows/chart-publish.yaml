@@ -1,0 +1,111 @@
+name: chart publish
+
+# Package the Helm chart at deploy/helm/sandbawks and publish it to the GitHub
+# Container Registry as an OCI artifact, so consumers get a versioned, pullable
+# chart (issue #460):
+#
+#   helm upgrade --install sandbawks oci://ghcr.io/hypotheosis/charts/sandbawks --version <x>
+#
+# Cadence mirrors the image build in kind-smoke.yaml:
+#   - push to main : republishes the chart at its current Chart.yaml `version`.
+#                    A re-push of the same version overwrites in place, so this
+#                    is idempotent for the moving `main` line. The ci.yml
+#                    chart-version-bump guard ensures the version actually
+#                    changes whenever the chart content does.
+#   - v* tag push  : the release path. Tagging `v1.2.3` already publishes the
+#                    semver-tagged images (kind-smoke.yaml, type=semver); this
+#                    publishes the matching chart so an operator gets a
+#                    coherent image + chart set from a single tag.
+#
+# appVersion is injected from the Cargo workspace version at package time
+# (`helm package --app-version`), so the published chart always names the code
+# revision it deploys. ci.yml's `helm` job additionally asserts the committed
+# Chart.yaml appVersion equals that same value, so the source file never drifts.
+#
+# No `paths:` filter, and no `pull_request` trigger:
+#   - `pull_request` is omitted on purpose — the chart is only ever published
+#     post-merge / on a tag, never from a PR.
+#   - a `paths:` filter is deliberately NOT used: on a tag push, paths are
+#     evaluated against the tagged commit's diff, so a release tag landing on a
+#     commit that didn't touch the chart would be silently skipped. Always
+#     running on main + tags (the publish is a few seconds of work on a tiny
+#     tgz) is simpler and free of that footgun.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+  packages: write
+
+# Serialize publishes on the same ref; a newer push supersedes an in-flight one.
+concurrency:
+  group: chart-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CHART_REPO: oci://ghcr.io/${{ github.repository_owner }}/charts
+
+jobs:
+  package-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.0
+      - name: Package and push chart to ghcr.io
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          chart_dir=deploy/helm/sandbawks
+
+          # appVersion tracks the Cargo workspace version (issue #460). Read the
+          # `version` under [workspace.package] specifically — Cargo.toml has
+          # many other `version = ` lines under [workspace.dependencies]. sed
+          # (not yq/tomlq) so this has no extra runner dependency.
+          app_version=$(sed -n '/^\[workspace.package\]/,/^\[/{ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p }' Cargo.toml | head -1)
+          if [ -z "$app_version" ]; then
+            echo "::error::could not read [workspace.package] version from Cargo.toml"; exit 1
+          fi
+          # The OCI tag and tgz filename come from the chart's OWN `version`,
+          # which is independent of appVersion (appVersion tracks the code,
+          # `version` tracks the chart).
+          chart_version=$(sed -n 's/^version:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' "$chart_dir/Chart.yaml" | head -1)
+          echo "Packaging chart version=${chart_version} with appVersion=${app_version}"
+
+          # --password-stdin keeps the token out of the process table and logs.
+          echo "$REGISTRY_TOKEN" | helm registry login ghcr.io \
+            --username "$REGISTRY_USER" --password-stdin
+
+          # `helm package` names the artifact sandbawks-<version>.tgz; locate it
+          # with a nullglob array + count check (set -u safe, and a stray second
+          # tgz fails loudly instead of silently joining paths).
+          helm package "$chart_dir" --app-version "$app_version" --destination /tmp/chart
+          shopt -s nullglob
+          tgzs=(/tmp/chart/sandbawks-*.tgz)
+          if [ ${#tgzs[@]} -ne 1 ]; then
+            echo "::error::expected exactly one packaged chart in /tmp/chart, got ${#tgzs[@]}"; exit 1
+          fi
+          chart_tgz=${tgzs[0]}
+          echo "Pushing ${chart_tgz} to ${CHART_REPO}"
+          helm push "$chart_tgz" "$CHART_REPO"
+
+          # Post-push round-trip: pull the artifact straight back and confirm its
+          # appVersion is what we injected, catching registry-side regressions at
+          # publish time instead of at an operator's first install. `helm pull
+          # --destination` does not create the directory, hence the mkdir.
+          mkdir -p /tmp/verify
+          helm pull "${CHART_REPO}/sandbawks" --version "$chart_version" --destination /tmp/verify
+          pulled_appver=$(tar -xzOf "/tmp/verify/sandbawks-${chart_version}.tgz" sandbawks/Chart.yaml \
+            | sed -n 's/^appVersion:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' | head -1)
+          if [ "$pulled_appver" != "$app_version" ]; then
+            echo "::error::published chart appVersion (${pulled_appver}) != injected (${app_version})"; exit 1
+          fi
+          echo "Verified published chart: version=${chart_version} appVersion=${pulled_appver}"
+
+          helm registry logout ghcr.io || true

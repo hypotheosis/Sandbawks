@@ -1,0 +1,56 @@
+{{- /*
+RBAC for the in-namespace OTel Collector's k8sattributes processor (issue #424).
+
+When `observability.collector.k8sattributes.enabled` is true, the collector
+uses the k8sattributes processor to stamp trusted pod identity (k8s.pod.name,
+k8s.pod.uid, k8s.namespace.name) on sandbox signals by looking up the sending
+Pod via source IP from the Kubernetes API. This requires a dedicated
+ServiceAccount with GET/LIST/WATCH pods within the release namespace.
+
+The ServiceAccount is referenced by the collector Deployment when this flag is
+true (otel-collector-deployment.yaml `spec.template.spec.serviceAccountName`).
+The Role is namespace-scoped (not ClusterRole) — the collector watches only
+Pods in its own namespace, which is all it needs to key on sandbox Pod source
+IPs. This is the minimal-privilege surface consistent with Kubernetes RBAC
+least-privilege guidelines.
+*/ -}}
+{{- if and .Values.observability.enabled .Values.observability.collector.enabled .Values.observability.collector.k8sattributes.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sandbawks-otel-collector
+  labels: {{- include "sandbawks.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sandbawks-otel-collector
+  labels: {{- include "sandbawks.labels" . | nindent 4 }}
+rules:
+  # k8sattributes processor: GET/LIST/WATCH pods so it can look up the sending
+  # Pod by source IP and extract trusted identity attributes. Namespace-scoped:
+  # the collector only needs to see Pods in its own release namespace.
+  #
+  # Only `pods` is granted: the configured extractors (k8s.pod.name,
+  # k8s.pod.uid, k8s.namespace.name) all derive from the Pod object itself.
+  # A `namespaces` watch is needed only to pull namespace-level labels or
+  # annotations, which this config does not extract — so granting it would be
+  # dead privilege (issue #424 review).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sandbawks-otel-collector
+  labels: {{- include "sandbawks.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sandbawks-otel-collector
+subjects:
+  - kind: ServiceAccount
+    name: sandbawks-otel-collector
+    namespace: {{ .Release.Namespace }}
+{{- end }}

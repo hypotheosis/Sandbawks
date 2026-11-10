@@ -1,0 +1,37 @@
+# kind cluster manifest for the CI smoke test (Plan 05 T13 of epic #136).
+#
+# Two-node layout:
+#   - control-plane: runs apiserver, etcd, scheduler, kube-controller-manager.
+#     kind already applies `node-role.kubernetes.io/control-plane=` here by
+#     default — no kubeadmConfigPatches needed (the v1beta4 config rejects
+#     the map form of kubeletExtraArgs anyway).
+#   - worker: where the `sandbawks-node` DaemonSet lands. Plan 05 wires the
+#     node DaemonSet to checkpoint sandbox containers via the host
+#     containerd's `runsc` runtime handler; that handler is registered by
+#     the pre-baked `sandbawks-kind-node` image (issue #147). With only a
+#     control-plane node the DaemonSet would still schedule (kind doesn't
+#     taint the control-plane), but the smoke test exercises a realistic
+#     two-node topology so per-node logic (e.g. `.spec.nodeName` filtering
+#     in the snapshot reconciler) has more than one node to be wrong on.
+#
+# Both nodes pin `ghcr.io/hypotheosis/sandbawks-kind-node:latest` — the image
+# built by `.github/workflows/kind-node-image.yaml` (issue #147) with
+# `runsc` + a containerd runtime handler for `io.containerd.runsc.v1`
+# pre-baked. Without this image the `gvisor` RuntimeClass (issue #148)
+# would still apply, but every Pod stamped with `runtimeClassName: gvisor`
+# would stay Pending with `RuntimeClassNotFound` or worse, crash on the
+# kubelet's first attempt to launch the sandbox.
+#
+# Local dev: `SANDBAWKS_KIND_GVISOR=1 just cluster-up` will build the
+# `:dev` tag of this image and re-tag it as `:latest` so the pin below
+# resolves to a freshly-built local image instead of attempting a pull
+# from ghcr.io. Without that env var, `just cluster-up` expects `:latest`
+# to already be present locally (either pre-built or pulled from ghcr.io).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: sandbawks-smoke
+nodes:
+  - role: control-plane
+    image: ghcr.io/hypotheosis/sandbawks-kind-node:latest
+  - role: worker
+    image: ghcr.io/hypotheosis/sandbawks-kind-node:latest

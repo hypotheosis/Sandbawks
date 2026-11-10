@@ -1,0 +1,132 @@
+name: shim publish
+
+# Build the static `containerd-shim-sandbawks-v1` from the in-repo Go subtree
+# (`shim/`) and publish it — with a sha512 — as a GitHub Release asset, so
+# `scripts/install-runsc-k3s.sh` can curl + verify it onto each k3s node as a
+# self-contained provisioning step (no manual copy, no dependency on the
+# sandbawks-node image being pulled first).
+#
+# Artifact layout (consumed by the install script's default URL):
+#   https://github.com/<owner>/<repo>/releases/download/shim-<version>/containerd-shim-sandbawks-v1
+#   https://github.com/<owner>/<repo>/releases/download/shim-<version>/containerd-shim-sandbawks-v1.sha512
+# Two releases are written per run, both marked pre-release so they never
+# displace a real `v*` release as the repository's "Latest":
+#   - `shim-sha-<short>` : immutable, the value operators should pin in
+#                          production (`--shim-version sha-<short>`).
+#   - `shim-latest`      : moving pointer for convenience / dev clusters,
+#                          recreated on each run at the triggering commit.
+#
+# The provisioning script itself is also attached to `shim-latest`, and is
+# always available from the default branch at
+#   https://raw.githubusercontent.com/<owner>/<repo>/main/scripts/install-runsc-k3s.sh
+#
+# Kept separate from ci.yml (which only builds/vets/tests the shim) because
+# publishing should fire only when the shipped artifacts can change, i.e. on
+# `shim/**` or the install script.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Immutable version to publish under (e.g. v1.2.3; the release is
+          tagged shim-<version>). Leave blank to use sha-<short> derived from
+          the triggering commit.
+        required: false
+        type: string
+        default: ''
+      update_latest:
+        description: >-
+          Also move the `shim-latest` release to this build. Untick to
+          publish a one-off `version` without disturbing `shim-latest`.
+        required: false
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths:
+      - 'shim/**'
+      - 'scripts/install-runsc-k3s.sh'
+      - '.github/workflows/shim-publish.yaml'
+
+permissions:
+  contents: write
+
+# Serialize publishes: two runs racing on the moving `shim-latest` release
+# would delete each other's freshly created release.
+concurrency:
+  group: shim-publish
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pin the toolchain to shim/go.mod's `go` directive — matches ci.yml's go
+      # job and ci/kind-node/Dockerfile's shim-builder stage so the published
+      # binary is built with the same toolchain as CI/kind.
+      - name: Install Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: shim/go.mod
+          cache: false
+      # CGO_ENABLED=0 -> fully static ELF that runs on any k3s host regardless
+      # of libc. -trimpath/-ldflags mirror ci/kind-node/Dockerfile exactly.
+      - name: Build static shim
+        run: |
+          set -euo pipefail
+          cd shim
+          CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' \
+            -o /tmp/containerd-shim-sandbawks-v1 \
+            ./cmd/containerd-shim-sandbawks-v1
+          file /tmp/containerd-shim-sandbawks-v1 || true
+      - name: Compute checksum
+        run: |
+          set -euo pipefail
+          cd /tmp
+          sha512sum containerd-shim-sandbawks-v1 > containerd-shim-sandbawks-v1.sha512
+          cat containerd-shim-sandbawks-v1.sha512
+      - name: Publish GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+          # workflow_dispatch inputs render to the empty string on push events,
+          # so the script falls back to its push-time defaults.
+          VERSION_OVERRIDE: ${{ github.event.inputs.version }}
+          UPDATE_LATEST: ${{ github.event.inputs.update_latest }}
+        run: |
+          set -euo pipefail
+
+          ver="${VERSION_OVERRIDE:-sha-${SHA:0:8}}"
+          update_latest=true
+          [ "${UPDATE_LATEST}" = "false" ] && update_latest=false
+
+          assets=(/tmp/containerd-shim-sandbawks-v1 /tmp/containerd-shim-sandbawks-v1.sha512)
+
+          # Immutable release: create once; re-running the same sha re-uploads
+          # identical assets (--clobber), so the step is idempotent.
+          tag="shim-${ver}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --target "$SHA" --prerelease --latest=false \
+              --title "containerd-shim-sandbawks-v1 ${ver}" \
+              --notes "Static containerd-shim-sandbawks-v1 built from ${SHA}. Install with: install-runsc-k3s.sh --shim-version ${ver}"
+          fi
+
+          if [ "${update_latest}" = true ]; then
+            # A release's tag cannot be moved in place, so recreate the moving
+            # pointer at this commit. The install script rides along so the
+            # bootstrap asset always matches the shim it installs.
+            gh release delete shim-latest --cleanup-tag --yes 2>/dev/null || true
+            gh release create shim-latest "${assets[@]}" scripts/install-runsc-k3s.sh \
+              --target "$SHA" --prerelease --latest=false \
+              --title "containerd-shim-sandbawks-v1 (latest main build)" \
+              --notes "Moving pointer to the newest shim built from main (currently ${ver}). Pin --shim-version ${ver} in production."
+            echo "Published shim version: ${ver} (and shim-latest + install script)"
+          else
+            echo "Published shim version: ${ver} (shim-latest left unchanged)"
+          fi
+          echo "Pin in production: install-runsc-k3s.sh --shim-version ${ver}"

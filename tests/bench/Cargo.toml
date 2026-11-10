@@ -1,0 +1,62 @@
+# Plan 06 T3 (issue #185) — pause/resume perf bench harness.
+#
+# Deliberately a *sibling* project, not a member of the workspace:
+#   - we don't want a perf regression to manifest as a workspace
+#     clippy / test failure (the issue body calls this out
+#     explicitly);
+#   - keeping it out of the workspace lets the bench depend on its
+#     own pinned `reqwest` / `serde_json` versions without dragging
+#     them into the controller / api / node binaries that ship in
+#     production images;
+#   - the workspace `Cargo.toml` lists members explicitly and does
+#     not auto-include `tests/bench/`, but the parent
+#     `.cargo/config.toml` (`rustflags = ["--cfg", "tokio_unstable"]`)
+#     would still apply when cargo walks upward. That flag is
+#     harmless here; the standalone `[workspace]` block below makes
+#     the bench self-contained so a `cargo build` inside this dir
+#     does not pull the parent workspace's manifest as a sibling.
+#
+# The bench is invoked from the host (or CI) via `just bench` and
+# drives the in-cluster gateway through HTTP — same `localhost:8080`
+# port-forward the api-smoke + pause-resume-smoke fixtures use.
+
+[workspace]
+
+[package]
+name = "sandbawks-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Pause/resume perf bench harness for sandbawks (Plan 06 T3 / issue #185)."
+
+[[bin]]
+name = "sandbawks-bench"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime. `rt-multi-thread` so the bench can drive uploads
+# and status polls concurrently; `macros` for `#[tokio::main]`.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "process"] }
+# `rustls-tls` to stay statically linkable and avoid an OpenSSL
+# runtime; `json` so we don't have to hand-roll body builders;
+# `stream` for the 1 GiB PUT body so we don't have to buffer it
+# entirely in memory before sending.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+# Wall-clock timestamp on the JSON output for trend analysis.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# `stream` feature on reqwest was needed when the bench's upload
+# was one big streaming PUT; the chunked-upload rewrite (see
+# `upload_payload` in src/main.rs) replaced that with `payload_mib`
+# sequential 1-MiB PUTs whose bodies are plain Vec<u8>. Keeping the
+# `stream` feature on reqwest is harmless but no longer load-bearing;
+# `futures::stream::iter` was the only direct futures use and is
+# gone, so the `futures` dep is dropped here.
+
+[profile.release]
+# Match the workspace release profile so a local `cargo run --release`
+# benchmark binary is comparable to what CI builds.
+lto = "thin"
+codegen-units = 1

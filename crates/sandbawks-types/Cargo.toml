@@ -1,0 +1,47 @@
+[package]
+name = "sandbawks-types"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared CRD types, DTOs, and error types for the sandbawks Kubernetes sandbox controller."
+
+[dependencies]
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+
+# Crypto for TeamAPIKey hashing (Plan 04 T3). Lives in
+# `sandbawks-types` so the controller (Sandbox admission) and the
+# api gateway (auth middleware) can share the helpers.
+hmac = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+base64 = { workspace = true }
+
+[features]
+# Opt-in helpers for downstream test code (currently
+# [`testing::FakeSnapshotStore`]). Off by default so the production
+# controller and api binaries don't pull the extra surface into their
+# release builds. Downstream `[dev-dependencies]` opt in with
+# `sandbawks-types = { ..., features = ["testing"] }`.
+testing = []
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+# Property-based testing for the SnapshotSink/Source round-trip + sha256
+# determinism test (Plan 05 T3). Aliased to `hegel` per the workspace
+# declaration — the crate's proc-macros embed the path `hegel::` in
+# their expansion.
+hegel = { workspace = true }
+
+[[bin]]
+name = "crdgen"
+path = "src/bin/crdgen.rs"

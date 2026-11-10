@@ -1,0 +1,17 @@
+# Fragment appended to `/etc/containerd/config.toml` by
+# `ci/kind-node/Dockerfile` at image build time, registering gVisor's
+# `runsc` as a CRI runtime handler under the name `runsc`.
+#
+# This file is NOT a conf.d/ drop-in — kind's containerd config doesn't
+# set `imports = [...]`, so nothing under `/etc/containerd/conf.d/`
+# would ever be loaded. The Dockerfile instead concatenates this
+# fragment onto the primary config; see the comment block above the
+# matching `RUN cat ... >> ...` step in the Dockerfile.
+#
+# Consumed by the `RuntimeClass: gvisor` resource (Plan 05 T12) whose
+# `handler:` field MUST equal the table key here. Pods that opt into
+# `runtimeClassName: gvisor` are then scheduled with `io.containerd.runsc.v1`
+# instead of the default `io.containerd.runc.v2`.
+
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runsc]
+  runtime_type = "io.containerd.runsc.v1"

@@ -1,0 +1,36 @@
+{{- /*
+ClusterIP fronting the in-namespace telemetry hop (issues #421 / #496).
+Workloads export to `http://sandbawks-otel-collector.<namespace>.svc:4318` — the
+default `OTEL_EXPORTER_OTLP_ENDPOINT` the `sandbawks.observabilityEnv` helper
+emits when the collector is enabled and `observability.endpoint` is left blank.
+
+When `observability.collector.prometheus.enabled` is true (#496 Phase 2), the
+Service also exposes the Prometheus scrape port (:9090 by default) so a
+Prometheus deployment can pull the metric series Vector re-exports. The Pod also
+carries `prometheus.io/scrape` annotations for annotation-based discovery.
+*/ -}}
+{{- if and .Values.observability.enabled .Values.observability.collector.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sandbawks.otelCollectorName" . }}
+  labels: {{- include "sandbawks.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "sandbawks.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: otel-collector
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+    {{- if .Values.observability.collector.prometheus.enabled }}
+    # Prometheus scrape port (#496 Phase 2): Vector's prometheus_exporter sink.
+    - name: prometheus
+      port: {{ .Values.observability.collector.prometheus.port }}
+      targetPort: prometheus
+    {{- end }}
+{{- end }}

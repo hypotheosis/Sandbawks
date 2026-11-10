@@ -1,0 +1,112 @@
+{{- /*
+In-namespace production telemetry-hop Deployment (issues #421 / #496). One per
+release namespace so distinct sandbawks installs can forward to distinct
+downstream APMs. As of #496 this runs Vector (`timberio/vector`); see
+`otel-collector-configmap.yaml` for the pipeline.
+
+The k8sattributes ServiceAccount path below is dead under Vector (the configmap
+fails fast when `k8sattributes.enabled`) and is retained only until #496 Phase 3
+reconciles the scrubbing features; it never renders while that guard stands.
+*/ -}}
+{{- if and .Values.observability.enabled .Values.observability.collector.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sandbawks.otelCollectorName" . }}
+  labels: {{- include "sandbawks.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.observability.collector.replicas }}
+  selector:
+    matchLabels:
+      {{- include "sandbawks.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: otel-collector
+  template:
+    metadata:
+      labels:
+        {{- include "sandbawks.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: otel-collector
+      annotations:
+        # Roll the collector Pod whenever the rendered pipeline config changes
+        # (a `configMap` volume alone does not restart the process). The dev
+        # fixture lacks this and must be restarted by hand.
+        checksum/config: {{ include (print $.Template.BasePath "/otel-collector-configmap.yaml") . | sha256sum }}
+        {{- if not .Values.observability.collector.exporter.existingTokenSecret }}
+        # Inline-token (dev) path only: roll the Pod when the chart-managed
+        # Secret changes (e.g. a `--set …exporter.token=` rotation). The
+        # existingTokenSecret path is owned by the operator.
+        checksum/secret: {{ include (print $.Template.BasePath "/otel-collector-secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- if .Values.observability.collector.prometheus.enabled }}
+        # Annotation-based Prometheus discovery (#496 Phase 2). prometheus-operator
+        # users should instead point a ServiceMonitor at the `prometheus` Service
+        # port; see docs/observability.md.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.observability.collector.prometheus.port | quote }}
+        prometheus.io/path: /metrics
+        {{- end }}
+    spec:
+      {{- if .Values.observability.collector.k8sattributes.enabled }}
+      # k8sattributes processor (issue #424): the collector needs a
+      # ServiceAccount with GET/LIST/WATCH pods so it can look up sending
+      # Pods by source IP. Rendered in otel-collector-rbac.yaml.
+      serviceAccountName: sandbawks-otel-collector
+      {{- end }}
+      containers:
+        - name: otel-collector
+          image: "{{ .Values.observability.collector.image.repository }}:{{ .Values.observability.collector.image.tag }}"
+          imagePullPolicy: {{ .Values.observability.collector.image.pullPolicy }}
+          args: ["--config=/etc/vector/vector.yaml"]
+          env:
+            # Bearer token for the downstream APM, interpolated into the
+            # exporter config via ${env:TRACEWAY_OTLP_TOKEN}. Held only here.
+            - name: TRACEWAY_OTLP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sandbawks.otelCollectorTokenSecretName" . }}
+                  key: token
+            # Known-good tenant identity the `resource` processor stamps onto
+            # every signal (${env:SANDBAWKS_NAMESPACE}), so customer-controlled
+            # sandbox envd can't spoof another tenant's service.namespace.
+            - name: SANDBAWKS_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+            {{- if .Values.observability.collector.prometheus.enabled }}
+            # Prometheus scrape endpoint (#496 Phase 2).
+            - name: prometheus
+              containerPort: {{ .Values.observability.collector.prometheus.port }}
+            {{- end }}
+            # Vector's internal API serves the /health probe endpoint.
+            - name: health
+              containerPort: 8686
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: health
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vector
+              readOnly: true
+            # Vector requires a writable data_dir even with in-memory buffers.
+            - name: data
+              mountPath: /vector-data-dir
+          resources:
+            {{- toYaml .Values.observability.collector.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "sandbawks.otelCollectorName" . }}
+        - name: data
+          emptyDir: {}
+{{- end }}

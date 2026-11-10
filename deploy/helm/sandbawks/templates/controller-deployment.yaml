@@ -1,0 +1,241 @@
+{{- if .Values.controller.enabled }}
+{{- /*
+  Foot-gun guard (issue #436): running >1 controller replica without leader
+  election means every replica reconciles and the snapshot sweeper runs on each
+  — the exact double-reconcile / double-sweep this feature exists to prevent.
+  Fail the render rather than ship a silently-broken HA deployment.
+*/}}
+{{- if and (gt (int .Values.controller.replicas) 1) (not .Values.controller.leaderElection.enabled) }}
+{{- fail "controller.replicas > 1 requires controller.leaderElection.enabled=true (see issue #436)" }}
+{{- end }}
+{{- /*
+  The usage spill PVC (#636) is mounted by every controller replica. With
+  replicas > 1 a ReadWriteOnce claim multi-attaches and the standbys get stuck —
+  use a ReadWriteMany storage class for HA (only the leader writes/drains, so a
+  shared volume is safe). Fail the render rather than ship a wedged standby.
+*/}}
+{{- if and .Values.usage.spill.enabled (gt (int .Values.controller.replicas) 1) (not (has "ReadWriteMany" .Values.usage.spill.accessModes)) }}
+{{- fail "usage.spill.enabled with controller.replicas > 1 requires a ReadWriteMany access mode in usage.spill.accessModes (a ReadWriteOnce spill PVC can't be mounted by standby replicas — see issue #636)" }}
+{{- end }}
+{{- /*
+  The controller reads the snapshot-store S3/Azure connection for THREE features
+  now: snapshot retention GC, the Phase 2 usage-event sink (#631), and the Phase 3
+  usage-ledger rollup (#632). Emit that shared connection env (and the credential
+  Secret `envFrom`) whenever ANY of them is enabled — hoisting it out of the
+  retention-only block per the note that block used to carry.
+*/}}
+{{- $s3Wired := or .Values.snapshotStore.retention.enabled .Values.usage.metering.enabled .Values.usage.rollup.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbawks-controller
+  labels: {{- include "sandbawks.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.controller.replicas }}
+  selector:
+    matchLabels:
+      {{- include "sandbawks.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        {{- include "sandbawks.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: sandbawks-controller
+      containers:
+        - name: controller
+          image: "{{ .Values.images.controller.repository }}:{{ .Values.images.controller.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.images.controller.pullPolicy }}
+          args:
+            - --runtime
+            - {{ .Values.controller.runtime | default "pod" | quote }}
+          env:
+            - name: SANDBAWKS_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: RUST_LOG
+              value: {{ .Values.controller.logLevel | default "info" | quote }}
+            {{- if .Values.controller.leaderElection.enabled }}
+            # Leader election (issue #436). POD_NAME provides the per-replica
+            # holder identity so the Lease clearly shows which Pod is leader.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SANDBAWKS_LEADER_ELECTION_ENABLED
+              value: "true"
+            - name: SANDBAWKS_LEADER_LEASE_NAME
+              value: {{ .Values.controller.leaderElection.leaseName | quote }}
+            - name: SANDBAWKS_LEADER_LEASE_DURATION_SECS
+              value: {{ .Values.controller.leaderElection.leaseDurationSeconds | quote }}
+            - name: SANDBAWKS_LEADER_RENEW_DEADLINE_SECS
+              value: {{ .Values.controller.leaderElection.renewDeadlineSeconds | quote }}
+            - name: SANDBAWKS_LEADER_RETRY_PERIOD_SECS
+              value: {{ .Values.controller.leaderElection.retryPeriodSeconds | quote }}
+            {{- end }}
+            {{- if .Values.snapshotStore.retention.enabled }}
+            # Snapshot retention GC (issue #186). When enabled, the
+            # controller spawns a ticker that LISTs the bucket and
+            # DELETEs objects older than the effective window.
+            - name: SANDBAWKS_RETENTION_ENABLED
+              value: "true"
+            - name: SANDBAWKS_RETENTION_DEFAULT_DURATION
+              value: {{ .Values.snapshotStore.retention.defaultDuration | quote }}
+            - name: SANDBAWKS_RETENTION_SCAN_INTERVAL
+              value: {{ .Values.snapshotStore.retention.scanInterval | quote }}
+            {{- end }}
+            {{- if .Values.usage.metering.enabled }}
+            # Per-team usage metering (epic #480 Phase 2, issue #631). The reconcile
+            # loop writes one authoritative NDJSON usage event per closed `Running`
+            # interval to the snapshot S3 bucket, under the event prefix below.
+            - name: SANDBAWKS_USAGE_METERING_ENABLED
+              value: "true"
+            {{- end }}
+            {{- if .Values.usage.rollup.enabled }}
+            # Hourly usage-ledger rollup (epic #480 Phase 3, issue #632). Reads the
+            # events above and writes idempotent per-(team,key,hour) UsageRecords
+            # under the ledger prefix below — the durable, invoice-safe ledger.
+            - name: SANDBAWKS_USAGE_ROLLUP_ENABLED
+              value: "true"
+            - name: SANDBAWKS_USAGE_ROLLUP_INTERVAL
+              value: {{ .Values.usage.rollup.interval | quote }}
+            {{- end }}
+            {{- if .Values.usage.spill.enabled }}
+            # Durable spill + replay for usage events (epic #480, issue #636). When a
+            # close-edge emission fails after its bounded retry (a sustained
+            # object-store outage), the controller parks the event on the spill PVC
+            # mounted below; a drainer replays it once the store recovers — so an
+            # outage costs latency, not lost billing. The drop is then only for the
+            # case where the spill itself is unavailable.
+            - name: SANDBAWKS_USAGE_SPILL_DIR
+              value: {{ .Values.usage.spill.mountPath | quote }}
+            - name: SANDBAWKS_USAGE_SPILL_DRAIN_INTERVAL
+              value: {{ .Values.usage.spill.drainInterval | quote }}
+            {{- end }}
+            {{- if or .Values.usage.metering.enabled .Values.usage.rollup.enabled }}
+            - name: SANDBAWKS_USAGE_PREFIX
+              value: {{ .Values.usage.eventPrefix | quote }}
+            - name: SANDBAWKS_USAGE_LEDGER_PREFIX
+              value: {{ .Values.usage.ledgerPrefix | quote }}
+            {{- end }}
+            {{- if $s3Wired }}
+            # Shared snapshot-store connection (provider selector + S3/Azure wiring,
+            # issue #585). Emitted when snapshot retention OR usage metering/rollup is
+            # enabled — all three read the same bucket. The node DaemonSet emits these
+            # unconditionally. S3_* stay set under either provider; the Azure vars are
+            # empty under the S3 default; SANDBAWKS_AZURE_ACCOUNT_KEY +
+            # SANDBAWKS_S3_ACCESS_KEY/SECRET_KEY arrive via the `envFrom` Secret below.
+            - name: SANDBAWKS_SNAPSHOT_PROVIDER
+              value: {{ .Values.snapshotStore.provider | quote }}
+            - name: SANDBAWKS_AZURE_ACCOUNT_NAME
+              value: {{ .Values.snapshotStore.azure.accountName | quote }}
+            - name: SANDBAWKS_AZURE_CONTAINER
+              value: {{ .Values.snapshotStore.azure.container | quote }}
+            - name: SANDBAWKS_AZURE_ENDPOINT
+              value: {{ .Values.snapshotStore.azure.endpoint | quote }}
+            - name: SANDBAWKS_S3_ENDPOINT
+              value: {{ .Values.snapshotStore.endpoint | quote }}
+            - name: SANDBAWKS_S3_BUCKET
+              value: {{ .Values.snapshotStore.bucket | quote }}
+            - name: SANDBAWKS_S3_REGION
+              value: {{ .Values.snapshotStore.region | quote }}
+            {{- end }}
+            # Scheduler-placed restore recovery tuning (epic #484, issue #490).
+            # OUTSIDE the retention/leader blocks so it always applies. These
+            # override the binary's compile-time defaults so the controller's
+            # `Resuming` recovery loop can be tuned per-cluster without a rebuild.
+            # (The restore *staging* wait is shim-side, not a controller env —
+            # see values.yaml `controller.restore`.)
+            - name: SANDBAWKS_RESUME_SCHEDULE_DEADLINE_SECS
+              value: {{ .Values.controller.restore.scheduleDeadlineSeconds | quote }}
+            - name: SANDBAWKS_RESUME_READY_DEADLINE_SECS
+              value: {{ .Values.controller.restore.readyDeadlineSeconds | quote }}
+            - name: SANDBAWKS_RESUME_MAX_RESTARTS
+              value: {{ .Values.controller.restore.maxRestarts | quote }}
+            # Bounded pause-checkpoint recovery (issue #510). A fail-closed pause
+            # leaves the workload Pod running and folds the Sandbox to a
+            # recoverable `Failed`; these tune the tiered retry → recover → GC
+            # path that reclaims that orphaned state.
+            - name: SANDBAWKS_PAUSE_MAX_RETRIES
+              value: {{ .Values.controller.pauseRecovery.maxRetries | quote }}
+            - name: SANDBAWKS_FAILED_GC_GRACE_SECS
+              value: {{ .Values.controller.pauseRecovery.gcGraceSeconds | quote }}
+            # PVC retention GC for paused `filesystem`-mode sandboxes (epic #603
+            # Phase 5 / issue #608). Independent of the snapshot store — a
+            # filesystem pause keeps a live PVC, not an S3 object — so it lives
+            # OUTSIDE the snapshot-retention block. When enabled, a paused
+            # `persistenceMode: filesystem` sandbox whose retained PVC(s) have
+            # outlived the window is deleted, cascading the PVCs via their
+            # ownerReferences. Default OFF so the field is inert until opted in.
+            {{- if .Values.controller.pvcRetention.enabled }}
+            - name: SANDBAWKS_PVC_RETENTION_ENABLED
+              value: "true"
+            - name: SANDBAWKS_PVC_RETENTION_DEFAULT_DURATION
+              value: {{ .Values.controller.pvcRetention.defaultDuration | quote }}
+            {{- end }}
+            # Staging root the controller records in the restore Pod's
+            # `io.sandbawks/restore-image-path` annotation (a *host* path the
+            # shim reads off the node filesystem). Relocatable as of issue #512:
+            # this, the node DaemonSet `staging-cache` mountPath/hostPath, and
+            # the node binary's `SANDBAWKS_STAGING_ROOT` all resolve through the
+            # `sandbawks.stagingRoot` helper (sourced from
+            # `node.hostPathStagingCache`), so they agree by construction and an
+            # operator relocates the root by overriding that one value.
+            - name: SANDBAWKS_RESTORE_STAGING_ROOT
+              value: {{ include "sandbawks.stagingRoot" . | quote }}
+            {{- if .Values.controller.fqdnEgress.enabled }}
+            # FQDN egress enforcement (issue #541). When enabled, a DNS-name
+            # `egressAllow` entry is additionally backed by a Cilium `toFQDNs`
+            # CiliumNetworkPolicy, so the resolved L3 connection is authorized
+            # (not merely DNS resolution). Requires a Cilium cluster whose
+            # CiliumNetworkPolicy CRD is installed; left off, name entries fall
+            # back to the DNS-port-only baseline (no regression). The DNS
+            # resolver location is configurable so non-stock clusters work
+            # without a rebuild.
+            - name: SANDBAWKS_FQDN_EGRESS_ENABLED
+              value: "true"
+            - name: SANDBAWKS_FQDN_DNS_NAMESPACE
+              value: {{ .Values.controller.fqdnEgress.dnsNamespace | quote }}
+            - name: SANDBAWKS_FQDN_DNS_POD_LABEL
+              value: {{ .Values.controller.fqdnEgress.dnsPodLabel | quote }}
+            {{- end }}
+            # Observability env (issue #294/#295) — intentionally OUTSIDE the
+            # retention if/end block above, so it applies regardless of whether
+            # snapshot retention is enabled.
+            {{- include "sandbawks.observabilityEnv" . | nindent 12 }}
+            {{- if and .Values.observability.enabled .Values.observability.collector.enabled .Values.observability.collector.splitPipelines.enabled }}
+            # Split-pipeline sandbox endpoint (issue #424). When split pipelines
+            # are enabled, the controller's OTEL_EXPORTER_OTLP_ENDPOINT points
+            # at the internal pipeline (port 4320). This separate env var tells
+            # pod_adapter to redirect sandbox envd to the sandbox pipeline (port
+            # 4318) instead of inheriting the controller's internal endpoint.
+            - name: SANDBAWKS_OTEL_SANDBOX_ENDPOINT
+              value: {{ include "sandbawks.otelCollectorSandboxEndpoint" . | quote }}
+            {{- end }}
+          {{- if $s3Wired }}
+          envFrom:
+            # SANDBAWKS_S3_ACCESS_KEY + SANDBAWKS_S3_SECRET_KEY (and the Azure
+            # account key) land here whenever snapshot retention OR usage
+            # metering/rollup is enabled — all three need the bucket credentials.
+            # The Secret is the same one the node DaemonSet mounts.
+            - secretRef:
+                name: {{ include "sandbawks.snapshotStoreSecretName" . }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.controller.resources | nindent 12 }}
+          {{- if .Values.usage.spill.enabled }}
+          # Durable spill PVC for usage events that fail emission during an
+          # object-store outage (#636). The drainer replays them on recovery.
+          volumeMounts:
+            - name: usage-spill
+              mountPath: {{ .Values.usage.spill.mountPath | quote }}
+          {{- end }}
+      {{- if .Values.usage.spill.enabled }}
+      volumes:
+        - name: usage-spill
+          persistentVolumeClaim:
+            claimName: sandbawks-controller-usage-spill
+      {{- end }}
+{{- end }}

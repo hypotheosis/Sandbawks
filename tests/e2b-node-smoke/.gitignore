@@ -1,0 +1,4 @@
+# Installed deps — restored by `bun install` / `npm install`. The
+# lockfile (bun.lock) IS committed so CI/contributors build against
+# pinned versions, mirroring tests/e2b-sdk-compat-js.
+node_modules/

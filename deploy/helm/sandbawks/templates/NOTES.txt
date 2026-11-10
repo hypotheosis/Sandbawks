@@ -1,0 +1,19 @@
+sandbawks chart installed.
+
+{{- if and .Values.observability.enabled .Values.observability.collector.enabled .Values.observability.collector.networkPolicy.enabled (not .Values.observability.collector.splitPipelines.enabled) }}
+
+WARNING: observability.collector.networkPolicy.enabled is set but
+splitPipelines.enabled is false.
+
+In this mode the NetworkPolicy restricts which Pods can reach the collector,
+but the sandbox/internal pipelines are NOT split — so the
+`transform/sandbox_service_name` scrubber is not wired in and a sandbox can
+still spoof `service.name` (e.g. masquerade as `sandbawks-api`). The
+NetworkPolicy alone does not deliver the service.name trust boundary.
+
+To get the full sandbox hardening, also set:
+
+    observability.collector.splitPipelines.enabled: true
+
+(see values.yaml, issue #424).
+{{- end }}

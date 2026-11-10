@@ -1,0 +1,124 @@
+[package]
+name = "envd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-sandbox agent that exposes filesystem, process, and PTY RPCs over gRPC to the sandbawks controller."
+build = "build.rs"
+
+[lib]
+name = "envd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "envd"
+path = "src/bin/envd.rs"
+
+# The generated tonic stubs depend on `prost` and `prost-types` (the
+# latter for `google.protobuf.Timestamp` in filesystem.proto), and on
+# the `tonic` runtime for the client/server traits. They are runtime
+# deps, not build-deps, because the include_proto! expansion compiles
+# as part of the crate proper.
+[dependencies]
+# Shared OpenTelemetry bootstrap (Phase 2, issue #296): the binary
+# entrypoint calls `init_telemetry` to install the logs/metrics/traces
+# pipelines in place of the old hand-rolled `init_tracing`.
+sandbawks-observability = { path = "../sandbawks-observability" }
+# OTel metrics API: `grpc_metrics` records per-method RPC duration/count off the
+# global meter `init_telemetry` registers (the API only, not the SDK).
+opentelemetry = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+# `tower` + `http` back the server-side gRPC trace-context extractor in
+# `trace.rs`: `GrpcTraceLayer` is a `tower::Layer`/`Service` over
+# `http::Request`, installed on the tonic server so each inbound RPC parents to
+# the api's `traceparent` (issue #298). `http::HeaderMap` is also the carrier
+# the axum `/__state` route reads its inbound context from.
+tower = { workspace = true }
+http = "1"
+# `process` is needed for `tokio::process::Command` used by the Process
+# service; `rt` is required because we call `tokio::spawn` from inside
+# RPC handlers (reader tasks, wait task, stdin forwarder); `time` is
+# needed for the post-exit retention sleep. `net` powers the secondary
+# HTTP listener (`tokio::net::TcpListener`) that fronts the `/__state`
+# pause-time probe.
+tokio = { workspace = true, features = ["fs", "io-util", "sync", "process", "rt", "time", "net"] }
+# `sync` enables `tokio_stream::wrappers::ReceiverStream`, which the
+# Process service uses to bridge the per-call mpsc channel of events
+# into the response stream.
+# `net` adds `TcpListenerStream`, used by the gRPC serve supervisor to serve a
+# self-bound listener (issue #560 drain) — bind explicitly so the drain is acked
+# only once a fresh listener is accepting.
+tokio-stream = { workspace = true, features = ["sync", "net"] }
+futures = { workspace = true }
+tracing = { workspace = true }
+# `tracing-subscriber` is used by the binary entrypoint to validate the
+# `--log-level` filter via `EnvFilter::try_new` before funnelling it into
+# `init_telemetry`; the library code only calls into `tracing` macros and
+# stays subscriber-agnostic.
+tracing-subscriber = { workspace = true }
+# `anyhow` is the application-level error type for the binary's
+# `main()`; service code keeps its `tonic::Status` / `io::Error`
+# surface instead of leaking `anyhow::Error` outward.
+anyhow = { workspace = true }
+# CLI parsing for the binary. `derive` for the `#[derive(Parser)]`
+# attribute; `env` so `--log-level` falls back to `RUST_LOG`.
+clap = { workspace = true }
+notify = { workspace = true }
+# `nix` is used by the Process service to send signals via
+# `nix::sys::signal::kill`. The workspace pins the `signal` + `process`
+# feature flags.
+nix = { workspace = true }
+# `serde` + `serde_json` back the pause/resume `envd-state.json`
+# snapshot in [`crate::state`]. `BTreeMap` (rather than `HashMap`) is
+# what makes the JSON encoding deterministic and round-trippable.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# `sha2` backs the writable-rootfs fingerprint in [`crate::fingerprint`]
+# — the resume divergence oracle (#236). The streaming `Digest` API
+# hashes file contents in bounded chunks so large overlays don't pin
+# memory.
+sha2 = { workspace = true }
+# `axum` powers the secondary HTTP listener that serves `GET /__state`.
+# The pause-time probe in `sandbawks-node::gvisor` issues a plain HTTP
+# GET against `:49984`; the route returns the live `EnvdState` JSON.
+# Only the routing + JSON extractor surface is used — the `ws` feature
+# the workspace pins for the gateway crate compiles away unused here.
+axum = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# `nix` (dev): the orphan-reaper integration test (`tests/reaper.rs`, issue
+# #459) makes the test process a child subreaper via `PR_SET_CHILD_SUBREAPER`
+# so an orphaned grandchild reparents onto it — standing in for envd running
+# as PID 1 — and asserts the reaper collects the resulting zombie. The
+# `process` feature the workspace pins gates the `prctl` module.
+nix = { workspace = true }
+# `grpc_metrics`'s re-arm test (issue #402) builds two real `SdkMeterProvider`s
+# backed by `InMemoryMetricExporter` to prove records re-bind to the swapped-in
+# provider. The SDK is a *test-only* dependency here — production `grpc_metrics`
+# uses only the OTel API and the SDK the binary installs at runtime. `testing`
+# gates the in-memory exporter; `metrics` is additive over the workspace set.
+opentelemetry_sdk = { workspace = true, features = ["metrics", "testing"] }
+# `net` (tokio + tokio-stream) is for the lifecycle integration test:
+# it binds a tokio `TcpListener` on `127.0.0.1:0` and feeds it to
+# `tonic::transport::Server::serve_with_incoming_shutdown` via
+# `TcpListenerStream`. The production binary does not need `net`
+# directly because tonic enables it transitively.
+# `test-util` enables `#[tokio::test(start_paused = true)]` virtual-time
+# control, used by the `join_with_drain_cap` drain-gate regression tests
+# so they assert timer ordering without sleeping in real wall-clock time.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "fs", "io-util", "sync", "process", "net", "test-util"] }
+tokio-stream = { workspace = true, features = ["sync", "net"] }
+# Property-based round-trip / determinism tests for the snapshot
+# module. Aliased to `hegel` per the workspace declaration — the
+# crate's proc-macros embed the path `hegel::` in their expansion.
+hegel = { workspace = true }
+
+# tonic-build drives protoc-based code generation in build.rs. Pulled
+# from the workspace so version bumps happen in one place.
+[build-dependencies]
+tonic-build = { workspace = true }

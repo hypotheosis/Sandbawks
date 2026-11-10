@@ -1,0 +1,16 @@
+{{- if .Values.api.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: sandbawks-api
+  labels: {{- include "sandbawks.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.api.service.type }}
+  ports:
+    - port: {{ .Values.api.service.port }}
+      targetPort: http
+      name: http
+  selector:
+    {{- include "sandbawks.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+{{- end }}

@@ -1,0 +1,223 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sandbawks-types",
+    "crates/sandbawks-controller",
+    "crates/envd",
+    "crates/sandbawks-api",
+    "crates/sandbawks-node",
+    "crates/sandbawks-observability",
+]
+
+[workspace.package]
+version = "0.1.29"
+edition = "2021"
+authors = ["Peter Grace <pete.grace@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/hypotheosis/sandbawks"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# CRD / k8s
+kube = { version = "0.97", default-features = false, features = ["client", "derive", "runtime", "rustls-tls"] }
+k8s-openapi = { version = "0.23", features = ["v1_31"] }
+schemars = "0.8"
+
+# serde stack
+serde = { version = "1.0.216", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# errors / logging
+thiserror = "2.0.6"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# OpenTelemetry (Plan/issue #294 → #295 Phase 1). The whole OTel stack is
+# pinned to one minor-release line in the workspace because the crates are
+# tightly coupled across minor versions — a sub-crate dragging in an
+# incompatible `0.x` silently no-ops the `tracing` → OTel bridge
+# (TRACING.md #2). `tracing-opentelemetry` is on its *paired* line (0.33),
+# which is intentionally a different number from the `opentelemetry*` 0.32
+# line — they advance in lockstep but are not the same version.
+#
+# SDK features `rt-tokio,trace,metrics,logs` enable all three signal
+# pipelines on the Tokio runtime; otlp features `http-proto,grpc-tonic`
+# make the OTLP protocol a *runtime* choice (`OTEL_EXPORTER_OTLP_PROTOCOL`)
+# rather than a recompile.
+#
+# The three `experimental_*_with_async_runtime` SDK features are
+# load-bearing, not optional: as of the 0.28 SDK refactor the *default*
+# batch/periodic processors export from a dedicated OS thread via
+# `futures_executor::block_on`, which cannot drive the async OTLP HTTP
+# (`reqwest-client`) or gRPC (`grpc-tonic`) clients — upstream's own docs
+# say to use the async-runtime processor for those. Without these, the
+# bridge compiles and logs appear but **zero spans reach the collector**
+# (the exact silent-no-op TRACING.md #1 warns about). They pull in the
+# Tokio-driven `*_with_async_runtime` processor modules this crate uses.
+#
+# otlp uses `default-features = false` to drop the implicit
+# `reqwest-blocking-client`; `reqwest-client` is the async client driven by
+# the Tokio runtime. The transports are intentionally left **without** a
+# rustls TLS feature: enabling otlp's `reqwest-rustls` drags reqwest's
+# default `aws-lc-rs` rustls provider into the *same* `rustls 0.23` that
+# `kube` drives with `ring`, leaving two providers enabled and making
+# `rustls::crypto::CryptoProvider` impossible to auto-select — `kube`'s
+# `Client::try_default()` then panics at startup. Phase 1 only needs to reach
+# a *local* collector over plaintext OTLP, so TLS transport (and aligning a
+# single rustls CryptoProvider across `kube` + otlp) is deferred to the
+# deployment phases (#294 Phases 4–7) where the production endpoint is wired.
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = [
+    "rt-tokio",
+    "trace",
+    "metrics",
+    "logs",
+    "experimental_trace_batch_span_processor_with_async_runtime",
+    "experimental_logs_batch_log_processor_with_async_runtime",
+    "experimental_metrics_periodicreader_with_async_runtime",
+] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "trace",
+    "metrics",
+    "logs",
+    "http-proto",
+    "grpc-tonic",
+    "reqwest-client",
+] }
+opentelemetry-appender-tracing = "0.32"
+tracing-opentelemetry = "0.33"
+# Optional `OTEL_DEBUG_STDOUT` debug exporter (OBSERVABILITY.md §5.2): a
+# synchronous stdout span processor attached *alongside* the OTLP batch one.
+# `default-features = false` + only `trace` keeps it to the span exporter the
+# bootstrap actually uses.
+opentelemetry-stdout = { version = "0.32", default-features = false, features = ["trace"] }
+# `service.instance.id` fallback when the K8s downward-API `POD_NAME` is
+# absent (e.g. local runs): a per-process random UUID keeps replicas
+# distinguishable. `v4` is the only feature the bootstrap needs.
+uuid = { version = "1", features = ["v4"] }
+
+# async / runtime
+#
+# Plan 05 T7 adds `process` to the feature set so `GvisorAdapter::pause`
+# can drive `runsc checkpoint` via `tokio::process::Command`. T8 adds
+# `net` so `GvisorAdapter::resume` can poll the restored envd's TCP
+# port via `tokio::net::TcpStream::connect`.
+tokio = { version = "1.42.0", features = ["rt-multi-thread", "macros", "time", "signal", "process", "fs", "net"] }
+async-trait = "0.1.83"
+futures = "0.3"
+anyhow = "1.0"
+
+# gRPC / proto (envd)
+tonic = { version = "0.12", features = ["transport", "tls", "codegen"] }
+tonic-build = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
+bytes = "1"
+# `socket2` exposes the stable `set_linger` setsockopt wrapper that
+# `sandbawks-node`'s envd `/__state` probe needs to force a TCP RST
+# (`SO_LINGER(0)`) on close — see `gvisor::HttpEnvdProbe`'s docs for
+# the gVisor-checkpoint-state-machine rationale. std's `set_linger`
+# is still unstable (rust-lang/rust#88494) and tokio's is deprecated,
+# so socket2 is the only stable path. Pinned to 0.5 because tokio
+# already pulls that in transitively.
+socket2 = "0.5"
+
+# unix / process (envd)
+nix = { version = "0.29", features = ["fs", "process", "signal", "term"] }
+
+# filesystem watch (envd) — `notify` 6.x exposes the inotify-backed
+# `RecommendedWatcher` on Linux that the `Filesystem.WatchDir` /
+# watcher trio RPCs need.
+notify = "6"
+
+# CLI parsing (envd binary)
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# test utilities
+tempfile = "3"
+
+# Property-based testing for the envd snapshot serialization
+# round-trip + determinism tests (Plan 03 T6). The crates.io package
+# is `hegeltest`, but its proc-macros are hard-coded to resolve their
+# runtime against the `hegel::` path — so we rename on import.
+hegel = { package = "hegeltest", version = "0.14" }
+
+# HTTP / WS gateway (Plan 04)
+# `multipart` was enabled by issue #191 — the E2B Python SDK uploads
+# file content as `multipart/form-data` via httpx's `files=` kwarg, and
+# the per-sandbox `/files` reverse proxy in `routes::envd_proxy`
+# extracts the file part via `axum::extract::Multipart`.
+axum = { version = "0.7", features = ["ws", "macros", "multipart"] }
+tower = "0.5"
+# `limit` (issue #191 review) backs `RequestBodyLimitLayer` on the
+# per-sandbox `/files` upload route — it bounds *both* the multipart
+# and raw-octet-stream paths at the HTTP-body layer with one explicit
+# ceiling, rather than relying on axum's implicit 2 MiB `DefaultBodyLimit`
+# (which only covers the multipart extractor and leaves the raw stream
+# unbounded).
+tower-http = { version = "0.6", features = ["trace", "request-id", "timeout", "cors", "util", "limit"] }
+
+# Crypto for TeamAPIKey hashing + HMAC signed URLs (Plan 04)
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2.6"
+base64 = "0.22"
+
+# Misc (Plan 04)
+mime = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+
+# Concurrent map used to key envd tonic `Channel`s by `host:port` so the
+# exec / file / metadata routes share a single h2 connection per sandbox
+# rather than re-handshaking per request (Plan 04 T9).
+dashmap = "6"
+
+# S3-compatible object storage (Plan 05). `rust-s3` natively supports
+# MinIO + AWS S3 endpoints; we disable the `native-tls` default in favor
+# of `tokio-rustls-tls` so the binary stays statically linkable on
+# distroless without an OpenSSL runtime. T6 consumes this; T1 only
+# declares it so subsequent task PRs are pure additions.
+rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls"] }
+
+# Azure Blob Storage backend (configurable snapshot storage, #585). Pinned to
+# the 0.21 family: `azure_storage_blobs` (plural) exposes the `BlobClient`
+# convenience methods (`put_block_blob`/`get_content`/`get_properties`/`delete`)
+# and `ContainerClient::list_blobs` the backend relies on. rustls TLS to match
+# the rest of the workspace (no OpenSSL).
+# `hmac_rust` supplies the pure-Rust HMAC-SHA256 used to sign shared-key
+# (account-key) requests. azure_core's `default = []`, so without this the
+# blob client panics at the first signed request ("HMAC signing request was
+# called without an hmac implementation"). `hmac_rust` (not `hmac_openssl`)
+# keeps the no-OpenSSL / rustls posture of the rest of the workspace.
+azure_core = { version = "0.21", default-features = false, features = ["hmac_rust"] }
+azure_storage = { version = "0.21", default-features = false, features = ["enable_reqwest_rustls"] }
+azure_storage_blobs = { version = "0.21", default-features = false, features = ["enable_reqwest_rustls"] }
+# `time` converts Azure's `time::OffsetDateTime` last-modified into chrono UTC
+# in `azure_retention.rs`. Already in the lockfile via the azure crates; the
+# workspace pin keeps the direct use under central version management.
+time = { version = "0.3", default-features = false }
+
+# Compression + archive (Plan 05). T7's pause path tars + zstds the
+# `runsc checkpoint` work-dir before streaming chunks to S3.
+zstd = "0.13"
+tar = "0.4"
+
+# Containerd gRPC client (Plan 05). T7 uses this to resolve the sandbox
+# container ID from `pod.status.containerStatuses[0].containerID` before
+# shelling out to `runsc checkpoint`. The Rust extension is part of the
+# containerd project and tracks the upstream proto.
+containerd-client = "0.8"
+
+# HTTP client used by the `GvisorAdapter::pause` envd-state probe
+# (Plan 05 T7). `rustls-tls` keeps the binary statically linkable on
+# the distroless image without an OpenSSL runtime, matching the policy
+# `rust-s3` already establishes.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

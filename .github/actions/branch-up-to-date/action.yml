@@ -1,0 +1,51 @@
+name: branch-up-to-date
+description: >-
+  Fail fast when a PR head does not contain the current tip of its base branch.
+  A PR that is behind base will have its CI results invalidated the moment it is
+  rebased / merged-up, so this gate lets heavy downstream jobs cascade-skip
+  rather than burn runner CPU on a build that has to be re-run anyway (#501).
+
+# Local composite action, referenced by both PR-triggered workflows (ci.yml and
+# kind-smoke.yaml) so the detection logic lives in exactly one place. Because it
+# is a local action (`uses: ./.github/actions/branch-up-to-date`), the calling
+# job must run `actions/checkout` *before* this step so the action file exists on
+# disk — and that checkout must use `fetch-depth: 0`, since `--is-ancestor` needs
+# enough history to connect the two commits (a shallow clone can report a
+# false "behind" when it simply can't see the connecting history).
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        # Read the event fields via env rather than inline `${{ }}` so a branch
+        # name containing shell metacharacters can never be interpolated into
+        # the script body (it only ever arrives as a quoted variable value).
+        EVENT_NAME: ${{ github.event_name }}
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -euo pipefail
+
+        # Only `pull_request` events can be "behind" a base branch. A push to
+        # main (or any non-PR trigger) is trivially up to date — short-circuit.
+        if [ "$EVENT_NAME" != "pull_request" ]; then
+          echo "Event '${EVENT_NAME}' is not a pull_request — gate trivially satisfied."
+          exit 0
+        fi
+
+        # Fetch the *live* tip of the base branch. We deliberately do NOT trust
+        # github.event.pull_request.base.sha: that is the base recorded when the
+        # PR event fired and can already be stale relative to the branch head.
+        git fetch --no-tags origin "$BASE_REF"
+
+        # The PR is up to date iff the current base tip (FETCH_HEAD) is an
+        # ancestor of the PR *head* commit. We test HEAD_SHA explicitly because
+        # actions/checkout checks out the synthetic merge ref (refs/pull/N/merge)
+        # whose parents already include the base tip — testing the checked-out
+        # HEAD would therefore always report "up to date".
+        if git merge-base --is-ancestor FETCH_HEAD "$HEAD_SHA"; then
+          echo "PR head contains the current tip of '${BASE_REF}' — up to date."
+        else
+          echo "::error::Branch is behind '${BASE_REF}'. Rebase or merge '${BASE_REF}' and push to re-run CI."
+          exit 1
+        fi

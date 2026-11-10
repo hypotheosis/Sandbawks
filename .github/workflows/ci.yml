@@ -1,0 +1,395 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege for the job token. `pull-requests`/`issues: write` let
+# ci/coverage-pr-comment.mjs upsert its PR comment (PR comments live on the
+# issues API). Fork PRs get a read-only token regardless; the comment step
+# then logs a warning instead of failing.
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  # Fail-fast gate: a PR whose branch is behind `main` has its CI results
+  # invalidated the moment it is rebased / merged-up, so building it now burns
+  # runner CPU for nothing (#501). This job runs first and unconditionally on
+  # every PR; `detect-changes` (and therefore every downstream job, which all
+  # chain off it) `needs:` it, so a behind branch fails here and the rest of the
+  # workflow is *skipped* rather than executed. The detection lives in a shared
+  # local composite action so kind-smoke.yaml reuses the exact same logic.
+  #
+  # `fetch-depth: 0` is required: the composite action uses
+  # `git merge-base --is-ancestor`, which needs enough history to connect the
+  # base tip and the PR head — a shallow clone can report a false "behind".
+  branch-up-to-date:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/branch-up-to-date
+
+  # Path-filter gate. The Rust correctness gate (fmt/clippy/test/doc)
+  # and the CRD-drift check both depend only on Rust-touching files,
+  # so a PR that only edits the helm chart / docs / CI YAML / justfile
+  # has nothing to validate there — skipping shaves ~10 min off
+  # chart-only PRs without giving up coverage on PRs that actually
+  # touch Rust. Runs always, fast (~5 s), and downstream jobs `needs:`
+  # it so skipped jobs report as success rather than stuck-pending.
+  #
+  # The filter list is intentionally inclusive of anything that could
+  # plausibly affect rustc output: source, manifests, lock file, build
+  # scripts (`*.rs` covers these), proto definitions consumed by
+  # tonic-build, the toolchain pin, .cargo/config.toml, and this
+  # workflow file itself (so a change to the rust job's recipe re-runs
+  # the rust job that change just edited).
+  detect-changes:
+    needs: branch-up-to-date
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      go: ${{ steps.filter.outputs.go }}
+      helm: ${{ steps.filter.outputs.helm }}
+      scripts: ${{ steps.filter.outputs.scripts }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - '**/*.proto'
+              - 'rust-toolchain*'
+              - '.cargo/**'
+              - '.github/workflows/ci.yml'
+              - 'deploy/crds/**'
+            go:
+              - 'shim/**'
+              # Belt-and-braces: today shim/ is the only Go in the tree, but
+              # a stray .go file or module added elsewhere later must not
+              # silently bypass this gate.
+              - '**/*.go'
+              - '**/go.mod'
+              - '**/go.sum'
+              - '.github/workflows/ci.yml'
+            # Anything under the chart directory. Drives the chart-version-bump
+            # guard below (issue #460): a PR that touches the chart must ship a
+            # distinct Chart.yaml `version` so the published OCI artifact is
+            # never silently overwritten with different content.
+            helm:
+              - 'deploy/helm/sandbawks/**'
+            # Shell scripts under scripts/ (the node installer + smoke helpers).
+            # These are system-state shell the Rust/Go suites can't exercise, so
+            # a broken script would otherwise ship unvalidated — see the
+            # `scripts` job below (#547). The workflow file itself is included so
+            # edits to the lint job re-run it.
+            scripts:
+              - 'scripts/**'
+              - '.github/workflows/ci.yml'
+
+  rust:
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.rust == 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      # Single source of truth for the line-coverage floor. Consumed by
+      # ci/coverage-pr-comment.mjs (comment icon + [!CAUTION] callout) and
+      # by `cargo llvm-cov report --fail-under-lines` below. Change here only.
+      COVERAGE_GATE: '76'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # llvm-tools-preview is required by cargo-llvm-cov for profdata
+          # merging; rustfmt + clippy are the existing lint components.
+          components: rustfmt, clippy, llvm-tools-preview
+      # `protoc` is required by the `envd` crate's build.rs (tonic-build
+      # invokes protoc on the vendored E2B schemas under crates/envd/proto/).
+      # Installing from apt keeps cold builds fast — building protoc from
+      # source via the `protobuf-src` crate would add ~5 minutes per run.
+      # `libprotobuf-dev` is required alongside `protobuf-compiler`
+      # because Ubuntu ships the well-known `.proto` includes
+      # (google/protobuf/timestamp.proto, etc.) only in the -dev
+      # package; filesystem.proto imports timestamp.proto.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      # cargo-llvm-cov writes instrumented artifacts to target/llvm-cov-target/,
+      # a separate subdirectory from target/debug/, so it shares the cache key
+      # with clippy/doc without cross-contaminating their artifacts. Pinned musl
+      # binary avoids a ~5-min cold `cargo install` on the ubuntu-latest runner.
+      - name: Install cargo-llvm-cov
+        env:
+          LLVM_COV_VERSION: '0.6.16'
+        run: |
+          curl -fsSL \
+              "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v${LLVM_COV_VERSION}/cargo-llvm-cov-x86_64-unknown-linux-musl.tar.gz" \
+              | sudo tar -xz -C /usr/local/bin cargo-llvm-cov
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # Run tests under llvm-cov instrumentation instead of plain `cargo test`
+      # so coverage is collected in the same pass — tests run exactly once.
+      # CARGO_INCREMENTAL=0 is required: incremental compilation and LLVM
+      # profiling instrumentation produce incompatible profdata.
+      - name: test (with coverage)
+        env:
+          CARGO_INCREMENTAL: '0'
+        run: cargo llvm-cov --no-report --workspace --all-targets
+      - name: docs
+        run: cargo doc --workspace --no-deps
+      # Generate reports from the profdata written by the `test (with coverage)`
+      # step above. Two formats: LCOV for external tooling (Codecov, genhtml,
+      # diff-coverage) and JSON for the PR comment script. Both calls reuse the
+      # same profdata — no second test run.
+      - name: Generate LCOV report
+        run: cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Generate JSON report
+        run: cargo llvm-cov report --json --output-path coverage.json
+      - name: Upload LCOV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+      # Post (or update-in-place) the coverage breakdown on the PR. `always()`
+      # so a gate breach in the next step doesn't retroactively suppress the
+      # report — the gate is last precisely so the comment lands first.
+      - name: Comment coverage on PR
+        if: (success() || failure()) && github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node ci/coverage-pr-comment.mjs coverage.json
+      # Hard gate: fail the job if total line coverage is below COVERAGE_GATE.
+      # Placed last so the comment above always posts before any failure.
+      - name: Enforce >=${{ env.COVERAGE_GATE }}% line coverage
+        run: cargo llvm-cov report --fail-under-lines "$COVERAGE_GATE"
+
+  # Go correctness gate for the shim/ subtree (Plan 07 T1, issue #205) —
+  # the one Go binary in an otherwise all-Rust repo (see shim/README.md).
+  # The Cargo workspace neither builds nor links it, so the `rust` job above
+  # never compiles it; without this job a broken shim would land unnoticed.
+  # Gated on the `go` path filter so Rust-only PRs skip it. The Go version
+  # is read from shim/go.mod (go-version-file) so CI tracks the module's
+  # declared toolchain with no second source of truth. Caching is off until
+  # the shim gains real dependencies (T2 adds gVisor + a go.sum); with no
+  # go.sum present, setup-go's module cache has nothing to key on.
+  go:
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.go == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: shim/go.mod
+          cache: false
+      # `go vet` does not validate formatting, so enforce gofmt explicitly
+      # — otherwise a misformatted .go file lands green. `gofmt -l` prints
+      # the paths needing formatting; a non-empty list fails the job.
+      - name: gofmt
+        run: |
+          cd shim
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+      - name: build
+        run: cd shim && go build ./...
+      - name: vet
+        run: cd shim && go vet ./...
+      - name: test
+        run: cd shim && go test ./...
+
+  crd-yaml-up-to-date:
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.rust == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # protoc is needed transitively: cargo resolves the whole workspace
+      # before running `-p sandbawks-types`, and envd's build.rs runs as
+      # part of that resolution.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+      - name: Regenerate CRDs
+        run: |
+          cargo run -p sandbawks-types --bin crdgen -- /tmp/crds
+          diff -ru deploy/crds /tmp/crds
+
+  helm:
+    # `needs` so the appVersion step below can gate on the path-filter outputs;
+    # lint/template still run unconditionally (they're cheap and catch any
+    # chart edit). detect-changes is ~5s, so the dependency is effectively free.
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.0
+      - name: helm lint
+        run: helm lint deploy/helm/sandbawks
+      - name: helm template
+        run: helm template test deploy/helm/sandbawks > /dev/null
+      # Keep the chart's appVersion tied to the Cargo workspace version
+      # (issue #460). The publish workflow injects this same value at package
+      # time via `helm package --app-version`; asserting equality here makes a
+      # committed Chart.yaml that has drifted from Cargo.toml fail fast in the
+      # PR rather than being silently corrected only at publish time.
+      #
+      # Gated to PRs that touch Rust (which includes Cargo.toml — see the
+      # `rust` filter) or the chart, i.e. the only PRs that can CREATE or FIX
+      # this drift. Without the gate, the step lives in an ungated job and a
+      # workspace-version bump that forgot Chart.yaml would fail CI on every
+      # unrelated open PR (docs-only, etc.) until corrected on `main`.
+      #
+      # Both values are read with `sed`, not a YAML/TOML parser, to avoid
+      # depending on yq/tomlq being present on the runner. The Cargo read is
+      # scoped to the [workspace.package] section because Cargo.toml has many
+      # other `version = ` lines (under [workspace.dependencies]).
+      - name: appVersion matches Cargo workspace version
+        if: ${{ needs.detect-changes.outputs.rust == 'true' || needs.detect-changes.outputs.helm == 'true' }}
+        run: |
+          set -euo pipefail
+          cargo_ver=$(sed -n '/^\[workspace.package\]/,/^\[/{ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p }' Cargo.toml | head -1)
+          chart_appver=$(sed -n 's/^appVersion:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' deploy/helm/sandbawks/Chart.yaml | head -1)
+          echo "Cargo [workspace.package] version: ${cargo_ver}"
+          echo "Chart.yaml appVersion:             ${chart_appver}"
+          if [ -z "$cargo_ver" ] || [ -z "$chart_appver" ]; then
+            echo "::error::failed to read one of the versions (cargo='${cargo_ver}' chart='${chart_appver}')"; exit 1
+          fi
+          if [ "$cargo_ver" != "$chart_appver" ]; then
+            echo "::error::Chart.yaml appVersion (${chart_appver}) must equal the Cargo workspace version (${cargo_ver}). Update deploy/helm/sandbawks/Chart.yaml."
+            exit 1
+          fi
+
+  # Require a Chart.yaml `version` bump on any PR that touches the chart, so
+  # every chart change ships a distinct, pullable OCI release (issue #460).
+  # PR-only: it needs a base ref to diff against, and the publish itself runs
+  # post-merge in chart-publish.yaml. Gated on the `helm` path filter so
+  # non-chart PRs skip it.
+  chart-version-bump:
+    needs: detect-changes
+    if: ${{ github.event_name == 'pull_request' && needs.detect-changes.outputs.helm == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require a Chart.yaml version bump
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          chart=deploy/helm/sandbawks/Chart.yaml
+          # checkout@v4 leaves the workspace on the PR merge ref with only a
+          # shallow slice of history, so the base branch tip may be absent.
+          # Fetch it explicitly and read the base copy of Chart.yaml from
+          # FETCH_HEAD (robust regardless of remote-tracking ref setup).
+          git fetch --no-tags --depth=1 origin "$BASE_REF"
+          # Reads `version:` from a Chart.yaml on stdin, so the same helper
+          # serves both the base (piped from `git show`) and the head (piped
+          # from the working tree).
+          read_ver() { grep -E '^version:' | head -1 | sed -E 's/^version:[[:space:]]*//; s/"//g'; }
+          base_ver=$(git show "FETCH_HEAD:${chart}" | read_ver)
+          head_ver=$(read_ver < "$chart")
+          echo "base Chart.yaml version: ${base_ver}"
+          echo "head Chart.yaml version: ${head_ver}"
+          # Intentionally only checks that the version DIFFERS, not that it
+          # increased: a pure-bash semver comparison is fiddly and low-value for
+          # v1. A decrease or a weird pre-release would pass here but is caught
+          # by review. Revisit if the release stream ever gets confusing.
+          if [ "$base_ver" = "$head_ver" ]; then
+            echo "::error::Files under deploy/helm/sandbawks changed but Chart.yaml version is still ${head_ver}. Bump 'version' so the published chart ships a distinct, pullable release."
+            exit 1
+          fi
+
+  # Behavioral regression guard for the rendered production Vector telemetry hop
+  # (issue #516, guarding the #496 / PR #515 fix class). PR #515 fixed a bug
+  # where the hop dropped 100% of traces/logs at the OTLP sink — and crucially
+  # `vector validate` passed the whole time, because it was a serialize-time
+  # source/sink SHAPE mismatch, not a syntax error. Nothing in CI exercised the
+  # serialize path, so the same class of bug could regress and ship green.
+  #
+  # scripts/vector-hop-roundtrip-smoke.sh closes that gap in two layers: (1)
+  # `vector validate` on the rendered chart config (fast topology/VRL preflight),
+  # then (2) a live OTLP round-trip — the rendered hop as sender, a second Vector
+  # as a stand-in Traceway intake, telemetrygen as the load generator — asserting
+  # no serialize-time drops, all three signals arrive, the spoofed
+  # `service.namespace` is re-stamped on traces/logs/metrics, the OTLP histogram
+  # bucket invariant holds, and the prometheus scrape surface is exposed. It uses
+  # the SAME pinned Vector image the chart deploys (read from values.yaml) so CI
+  # and prod can't drift.
+  #
+  # Runs on the hosted runner's own Docker daemon because the harness drives
+  # real containers; the runner image ships docker + jq, helm is pinned below,
+  # and yq is installed as a pinned static binary. Gated on the `helm` filter (any chart
+  # change) OR the `scripts` filter (the harness itself / this workflow file), so
+  # it runs exactly when the rendered config or the guard could change.
+  vector-hop:
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.helm == 'true' || needs.detect-changes.outputs.scripts == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.0
+      # Pinned static yq binary so the harness does not depend on whichever yq
+      # the runner image happens to ship.
+      - name: Install yq
+        env:
+          YQ_VERSION: v4.44.6
+        run: |
+          sudo curl -fsSLo /usr/local/bin/yq \
+              "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          sudo chmod +x /usr/local/bin/yq
+      - name: Vector hop round-trip regression guard
+        run: bash scripts/vector-hop-roundtrip-smoke.sh
+
+  # Shell-lint gate. The node installer (install-runsc-k3s.sh) and the smoke
+  # helpers are system-state shell that the Rust/Go suites can't exercise, so
+  # without this a `set -e` footgun or a quoting bug ships unvalidated — the
+  # other path filters never matched scripts/** at all (#547). Mirrors the
+  # rust/go gates: gated on detect-changes so non-shell PRs skip it, and
+  # downstream of it nothing depends on this, so it reports independently.
+  scripts:
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.scripts == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
+      - name: shellcheck + bash -n every shell script under scripts/
+        run: |
+          set -euo pipefail
+          found=0
+          while IFS= read -r f; do
+            found=1
+            echo "::group::${f}"
+            bash -n "$f"
+            shellcheck "$f"
+            echo "::endgroup::"
+          done < <(find scripts -type f -name '*.sh' -print | sort)
+          # Guard against the filter matching while the glob finds nothing (e.g.
+          # a future rename), which would otherwise pass vacuously.
+          [ "$found" -eq 1 ] || { echo "::error::scripts filter matched but no *.sh found under scripts/"; exit 1; }

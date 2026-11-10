@@ -1,0 +1,27 @@
+{{- if and .Values.controller.enabled .Values.usage.spill.enabled }}
+{{- /*
+  Durable spill volume for usage events that fail emission during an object-store
+  outage (epic #480, issue #636). The controller parks failed events here and a
+  background drainer replays them to the object store on recovery, so a multi-minute
+  outage costs latency rather than lost billing. Mounted by the controller
+  Deployment at `usage.spill.mountPath`.
+
+  ReadWriteOnce is the default (fine for the single-replica controller). For HA
+  (replicas > 1) the deployment template requires a ReadWriteMany access mode here,
+  since every replica mounts the volume even though only the leader writes/drains.
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sandbawks-controller-usage-spill
+  labels: {{- include "sandbawks.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.usage.spill.accessModes | nindent 4 }}
+  {{- with .Values.usage.spill.storageClassName }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.usage.spill.size | quote }}
+{{- end }}

@@ -1,0 +1,346 @@
+{{- /*
+Pipeline config for the in-namespace production telemetry hop (issues #421 /
+#496). As of #496 the hop runs **Vector** (`timberio/vector`) instead of the
+OpenTelemetry Collector contrib distro; the OTLP receiver ports, the Secret
+contract, and the credential-isolation property are preserved verbatim so no
+client wiring changes.
+
+Topology (single pipeline — the default):
+  - `sources.otlp` (opentelemetry): receives OTLP on gRPC :4317 / HTTP :4318
+    from every workload (api, controller, node, and customer-controlled sandbox
+    envd), exactly the ports the OTel Collector exposed. `use_otlp_decoding` is
+    per-signal: logs/traces are kept as raw OTLP envelopes (so the otlp-codec
+    sinks can re-serialize them losslessly), metrics are decoded to native
+    Vector metric events (so the prometheus_exporter can re-expose them). See
+    the source block for why the sink rejects native-decoded logs/traces.
+  - `transforms.stamp_*` (remap/VRL): re-establish the tenant trust boundary by
+    re-stamping `service.namespace` / `sandbawks.tenant` from the collector
+    Pod's OWN namespace (`${SANDBAWKS_NAMESPACE}`, injected via the downward
+    API) — the Vector equivalent of the old `resource` processor. A
+    customer-controlled envd therefore cannot spoof another tenant. The shape
+    differs per signal: logs/traces stamp the OTLP envelope's
+    `resource.attributes[]` KeyValue array; metrics stamp the native
+    `resource.`-prefixed tags.
+  - `transforms.metrics_to_log` + `transforms.build_otlp_metrics`: the Traceway
+    metric leg. Vector has no native metric -> OTLP-envelope path, so native
+    metric events are converted to logs and hand-assembled into an OTLP
+    `resourceMetrics` envelope. This is lossy (OTLP temporality/monotonicity is
+    discarded on decode); the prometheus_exporter remains the lossless surface.
+  - `sinks.traceway_*` (opentelemetry): forward each signal to Traceway over
+    OTLP/HTTP with `Authorization: Bearer ${TRACEWAY_OTLP_TOKEN}`. One sink per
+    signal because OTLP/HTTP uses distinct `/v1/{traces,metrics,logs}` paths and
+    Vector's opentelemetry sink does not auto-append the signal path.
+  - `sinks.prometheus` (prometheus_exporter, #496 Phase 2): when
+    `observability.collector.prometheus.enabled`, re-expose the received metric
+    series on a Prometheus scrape endpoint (`:9090/metrics`) so a Prometheus
+    deployment can pull the same metrics Vector also pushes to Traceway.
+
+Vector performs `${VAR}` interpolation against the process environment at config
+load time, so both the Traceway bearer token and the downward-API namespace are
+substituted from env and never land in this ConfigMap.
+
+The split-pipeline / k8sattributes scrubbing features (issue #424) are NOT yet
+ported to Vector — that is #496 Phase 3. The guard below fails fast rather than
+silently rendering a single-pipeline Vector when an operator enables them.
+
+Distinct from the dev-only debug fixture at
+`deploy/kind/fixtures/otel-collector.yaml`, which dumps signals to stdout.
+*/ -}}
+{{- if and .Values.observability.enabled .Values.observability.collector.enabled }}
+{{- if or .Values.observability.collector.splitPipelines.enabled .Values.observability.collector.k8sattributes.enabled }}
+{{- fail "observability.collector.splitPipelines / k8sattributes are not yet supported on the Vector hop (issue #496 Phase 3). Leave both disabled, or pin the pre-#496 chart for the OTel Collector split-pipeline behavior." }}
+{{- end }}
+{{- $endpoint := required "observability.collector.exporter.endpoint is required when observability.collector.enabled=true" .Values.observability.collector.exporter.endpoint | trimSuffix "/" }}
+{{- $prom := .Values.observability.collector.prometheus }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sandbawks.otelCollectorName" . }}
+  labels: {{- include "sandbawks.labels" . | nindent 4 }}
+data:
+  vector.yaml: |
+    # State/buffer scratch dir. Sinks use in-memory buffers (an export backlog
+    # is lost on Pod restart — acceptable for a sandbox telemetry path), but
+    # Vector still requires a writable data_dir; it is backed by an emptyDir.
+    data_dir: /vector-data-dir
+    # Internal API exposes the /health endpoint the kubelet probes hit.
+    api:
+      enabled: true
+      address: "[::]:8686"
+    sources:
+      otlp:
+        type: opentelemetry
+        # Per-signal decoding mode (Vector >=0.50). The `opentelemetry` SINK's
+        # `codec: otlp` only serializes events that are already shaped as an OTLP
+        # envelope (top-level `resourceSpans` / `resourceLogs` / `resourceMetrics`).
+        # The source's DEFAULT (`use_otlp_decoding: false`) instead FLATTENS OTLP
+        # into Vector's native model (resource attrs under `.resources`/`.tags`,
+        # no envelope), which the sink then rejects ("event does not contain OTLP
+        # top-level field") and drops. So:
+        #   - logs/traces: `true` => raw OTLP envelope preserved, forwarded to
+        #     Traceway losslessly via the otlp-codec sinks below.
+        #   - metrics: `false` => kept as native Vector metric events so the
+        #     `prometheus_exporter` sink can re-expose them; the Traceway metric
+        #     path rebuilds the OTLP envelope from these (see build_otlp_metrics).
+        use_otlp_decoding:
+          logs: true
+          traces: true
+          metrics: false
+        grpc:
+          # IPv6/IPv4 dual-stack wildcard: sandbox Pods are IPv6-primary on the
+          # prod cluster, so an IPv4-only bind would refuse them (issue #421).
+          address: "[::]:4317"
+        http:
+          address: "[::]:4318"
+    transforms:
+      # Re-stamp tenant identity from a known-good source the customer cannot
+      # influence: the collector Pod's OWN namespace (`${SANDBAWKS_NAMESPACE}`).
+      # A customer-controlled envd therefore cannot spoof another tenant's
+      # `service.namespace`. The event shape differs per signal, so the VRL does:
+      #
+      #   logs/traces (OTLP passthrough): resource attributes live in the OTLP
+      #   envelope as `.resource{Logs,Spans}[].resource.attributes[]` — an array
+      #   of `{key, value:{stringValue}}` KeyValue objects. We drop any existing
+      #   service.namespace / sandbawks.tenant entries (the customer's spoof) and
+      #   append our own, per resource entry.
+      stamp_logs:
+        type: remap
+        inputs: ["otlp.logs"]
+        source: |
+          stamped = [
+            {"key": "service.namespace", "value": {"stringValue": "${SANDBAWKS_NAMESPACE}"}},
+            {"key": "sandbawks.tenant", "value": {"stringValue": "${SANDBAWKS_NAMESPACE}"}}
+          ]
+          .resourceLogs = map_values(array(.resourceLogs) ?? []) -> |rl| {
+            kept = filter(array(rl.resource.attributes) ?? []) -> |_i, a| {
+              k = string(a.key) ?? ""
+              k != "service.namespace" && k != "sandbawks.tenant"
+            }
+            rl.resource.attributes = flatten([kept, stamped])
+            rl
+          }
+      stamp_traces:
+        type: remap
+        inputs: ["otlp.traces"]
+        source: |
+          stamped = [
+            {"key": "service.namespace", "value": {"stringValue": "${SANDBAWKS_NAMESPACE}"}},
+            {"key": "sandbawks.tenant", "value": {"stringValue": "${SANDBAWKS_NAMESPACE}"}}
+          ]
+          .resourceSpans = map_values(array(.resourceSpans) ?? []) -> |rs| {
+            kept = filter(array(rs.resource.attributes) ?? []) -> |_i, a| {
+              k = string(a.key) ?? ""
+              k != "service.namespace" && k != "sandbawks.tenant"
+            }
+            rs.resource.attributes = flatten([kept, stamped])
+            rs
+          }
+      # Metrics stay NATIVE (Vector metric events). The opentelemetry source
+      # flattens OTLP resource attributes onto metric TAGS with a `resource.`
+      # prefix (e.g. `resource.service.namespace`), so the stamp must overwrite
+      # *that* key — overwriting `service.namespace` (no prefix, the pre-#496
+      # behavior) left the customer-supplied `resource.service.namespace` intact
+      # and the tenant boundary open. This stamped stream feeds BOTH the
+      # prometheus leg (via `sanitize_prometheus_names`, which maps `.`->`_` in
+      # the names) and the Traceway OTLP rebuild below.
+      stamp_metrics_native:
+        type: remap
+        inputs: ["otlp.metrics"]
+        source: |
+          .tags."resource.service.namespace" = "${SANDBAWKS_NAMESPACE}"
+          .tags."resource.sandbawks.tenant" = "${SANDBAWKS_NAMESPACE}"
+      # Prometheus naming rules forbid `.` in metric names (`[a-zA-Z_:][a-zA-Z0-9_:]*`)
+      # and label names (`[a-zA-Z_][a-zA-Z0-9_]*`). The opentelemetry source
+      # exposes OTLP resource attributes as `resource.`-prefixed DOTTED tag keys
+      # (e.g. `resource.service.namespace`), and OTLP metric names are dotted by
+      # convention (e.g. `http.server.duration`), so feeding the native stream to
+      # `prometheus_exporter` unchanged emits an exposition with `.` in the names.
+      # Classic scrapers silently rewrite those to `_`, but the raw `/metrics`
+      # surface is then non-conformant (and UTF-8 scrapers keep the dots,
+      # diverging from everyone else). Sanitize here so the exposition is valid
+      # regardless of scraper. This transform feeds the prometheus sink ONLY — the
+      # Traceway OTLP leg below keeps the dotted keys, which ARE valid OTLP
+      # attribute names.
+      sanitize_prometheus_names:
+        type: remap
+        inputs: ["stamp_metrics_native"]
+        source: |
+          .name = replace(string!(.name), ".", "_")
+          # map_keys is last-writer-wins: if two tag keys sanitize to the same
+          # name (e.g. a dotted `resource.service.namespace` and a literal
+          # `resource_service_namespace`) one silently overwrites the other.
+          # Harmless in practice — OTLP attributes are dotted by convention and
+          # the stamp keys we control don't collide — so no de-dup is needed.
+          .tags = map_keys(object(.tags) ?? {}) -> |key| { replace(key, ".", "_") }
+      # Traceway metric path (the "Both" choice for issue #496): convert each
+      # native metric event to a log event, then hand-build the OTLP
+      # `resourceMetrics` envelope the otlp-codec sink requires. Vector has no
+      # native metric -> OTLP-envelope path, so this reconstructs it in VRL.
+      #
+      # LOSSY BY CONSTRUCTION (accepted trade-off, see changelog): the
+      # opentelemetry source discards OTLP monotonic/temporality on decode, so
+      # every Vector `counter` is re-emitted as a cumulative monotonic `sum` —
+      # up-down counters (e.g. http.server.active_requests) are therefore
+      # mislabeled monotonic on the Traceway side. Start time is unknown post
+      # decode, so startTimeUnixNano is set equal to timeUnixNano. The
+      # prometheus_exporter path is unaffected and remains the lossless metric
+      # surface; prefer it for metric correctness.
+      metrics_to_log:
+        type: metric_to_log
+        inputs: ["stamp_metrics_native"]
+      build_otlp_metrics:
+        type: remap
+        inputs: ["metrics_to_log"]
+        source: |
+          tnano = to_unix_timestamp(.timestamp, unit: "nanoseconds") ?? to_unix_timestamp(now(), unit: "nanoseconds")
+          # Split tags into OTLP resource attributes (the `resource.`-prefixed
+          # ones, prefix stripped) vs data-point attributes (everything else).
+          res_attrs = []
+          dp_attrs = []
+          for_each(object(.tags) ?? {}) -> |k, v| {
+            kv = {"key": "", "value": {"stringValue": to_string(v) ?? ""}}
+            if starts_with(k, "resource.") {
+              kv.key = slice!(k, 9)
+              res_attrs = push(res_attrs, kv)
+            } else {
+              kv.key = k
+              dp_attrs = push(dp_attrs, kv)
+            }
+          }
+          metric = {"name": string(.name) ?? ""}
+          if exists(.gauge) {
+            metric.gauge = {"dataPoints": [{
+              "asDouble": .gauge.value,
+              "startTimeUnixNano": tnano, "timeUnixNano": tnano,
+              "attributes": dp_attrs
+            }]}
+          } else if exists(.counter) {
+            metric.sum = {
+              "aggregationTemporality": 2, "isMonotonic": true,
+              "dataPoints": [{
+                "asDouble": .counter.value,
+                "startTimeUnixNano": tnano, "timeUnixNano": tnano,
+                "attributes": dp_attrs
+              }]
+            }
+          } else if exists(.aggregated_histogram) {
+            # OTLP explicitBounds excludes the implicit +inf bucket; Vector
+            # carries it as a trailing `{"upper_limit": "inf"}` (a STRING in
+            # 0.56, confirmed by round-trip). Keep every bucket count, drop only
+            # non-numeric bounds (the +inf sentinel).
+            bounds = []
+            counts = []
+            for_each(array(.aggregated_histogram.buckets) ?? []) -> |_i, b| {
+              counts = push(counts, b.count)
+              ul = b.upper_limit
+              if is_float(ul) || is_integer(ul) {
+                bounds = push(bounds, ul)
+              }
+            }
+            # OTLP invariant: bucketCounts has exactly one more entry than
+            # explicitBounds. If a Vector upgrade changes the +inf bound to a
+            # numeric `f64::INFINITY` it would slip past the filter above and
+            # break this — fail LOUD (log + drop) rather than ship a malformed
+            # histogram to Traceway.
+            if length(bounds) != length(counts) - 1 {
+              log("build_otlp_metrics: histogram bucketCounts/explicitBounds mismatch (Vector +inf representation changed?) — dropping malformed histogram", level: "error")
+              abort
+            }
+            metric.histogram = {
+              "aggregationTemporality": 2,
+              "dataPoints": [{
+                "count": .aggregated_histogram.count,
+                "sum": .aggregated_histogram.sum,
+                "explicitBounds": bounds, "bucketCounts": counts,
+                "startTimeUnixNano": tnano, "timeUnixNano": tnano,
+                "attributes": dp_attrs
+              }]
+            }
+          } else {
+            # No OTLP-envelope mapping here for Vector `set` / `distribution` /
+            # `summary` metric types. Sandbawks emits none of these (only gauge,
+            # counter, histogram), so this is a dead path today; log so a future
+            # metric type silently vanishing from the Traceway leg is visible.
+            # The native prometheus_exporter leg still exposes what it can.
+            log("build_otlp_metrics: unsupported metric type for OTLP rebuild (set/distribution/summary?) — dropping from Traceway leg only", level: "warn")
+            abort
+          }
+          . = {"resourceMetrics": [{
+            "resource": {"attributes": res_attrs},
+            "scopeMetrics": [{"scope": {}, "metrics": [metric]}]
+          }]}
+    sinks:
+      # Forward to Traceway over OTLP/HTTP. The bearer token is interpolated
+      # from ${TRACEWAY_OTLP_TOKEN} (mounted from the collector Secret) and stays
+      # on this Pod. One sink per signal: OTLP/HTTP uses distinct /v1/{signal}
+      # paths and the opentelemetry sink does not auto-append them.
+      #
+      # Vector has no `memory_limiter` equivalent to the old OTel Collector
+      # (which shed data at 80% mem before the kernel OOM-killed it mid-batch).
+      # Each forwarding sink instead uses an explicit BOUNDED in-memory buffer
+      # that DROPS the newest events once full — e.g. when Traceway is
+      # unreachable and the backlog grows. This reproduces the old
+      # drop-before-OOM property: the hop sheds telemetry under sustained
+      # backlog rather than blocking the OTLP source (which would back-pressure
+      # exporting clients) or growing unbounded into the 256Mi limit. Raise
+      # `max_events` if short Traceway blips lose more than you can tolerate.
+      traceway_traces:
+        type: opentelemetry
+        inputs: ["stamp_traces"]
+        protocol:
+          type: http
+          uri: {{ printf "%s/v1/traces" $endpoint | quote }}
+          method: post
+          encoding:
+            codec: otlp
+          auth:
+            strategy: bearer
+            token: "${TRACEWAY_OTLP_TOKEN}"
+        buffer:
+          type: memory
+          max_events: {{ .Values.observability.collector.bufferMaxEvents }}
+          when_full: drop_newest
+      traceway_metrics:
+        type: opentelemetry
+        inputs: ["build_otlp_metrics"]
+        protocol:
+          type: http
+          uri: {{ printf "%s/v1/metrics" $endpoint | quote }}
+          method: post
+          encoding:
+            codec: otlp
+          auth:
+            strategy: bearer
+            token: "${TRACEWAY_OTLP_TOKEN}"
+        buffer:
+          type: memory
+          max_events: {{ .Values.observability.collector.bufferMaxEvents }}
+          when_full: drop_newest
+      traceway_logs:
+        type: opentelemetry
+        inputs: ["stamp_logs"]
+        protocol:
+          type: http
+          uri: {{ printf "%s/v1/logs" $endpoint | quote }}
+          method: post
+          encoding:
+            codec: otlp
+          auth:
+            strategy: bearer
+            token: "${TRACEWAY_OTLP_TOKEN}"
+        buffer:
+          type: memory
+          max_events: {{ .Values.observability.collector.bufferMaxEvents }}
+          when_full: drop_newest
+      {{- if $prom.enabled }}
+      # Prometheus scrape endpoint (#496 Phase 2): re-expose the received metric
+      # series at :9090/metrics. Fed from the SAME tenant-stamped metric stream
+      # as the Traceway sink, so a scrape and the OTLP push carry identical
+      # labels. Standing up Prometheus itself is the operator's job (out of
+      # scope); this only exposes the surface.
+      prometheus:
+        type: prometheus_exporter
+        inputs: ["sanitize_prometheus_names"]
+        address: "[::]:{{ $prom.port }}"
+      {{- end }}
+{{- end }}

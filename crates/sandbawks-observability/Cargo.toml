@@ -1,0 +1,59 @@
+[package]
+name = "sandbawks-observability"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Shared OpenTelemetry bootstrap (logs, metrics, traces over OTLP) for the sandbawks binaries."
+
+# Declare the library target explicitly (rather than relying on filesystem
+# autodiscovery of `src/lib.rs`). The Docker `cargo chef` planner stage copies
+# only the manifests — not `src/` — and `cargo metadata` errors with "no
+# targets specified" for a crate whose only target would be autodiscovered.
+# Every other workspace crate already does this; this one was the exception.
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-appender-tracing = { workspace = true }
+opentelemetry-stdout = { workspace = true }
+
+anyhow = { workspace = true }
+uuid = { workspace = true }
+# The dedicated export runtime (issue #539) is a `tokio::runtime::Runtime` built
+# by hand, so this crate now needs tokio at runtime — not just under `[dev-
+# dependencies]`. The workspace base already enables `rt-multi-thread` + `time`,
+# which is all `ExportRuntime` requires (multi-thread builder + the time driver
+# the batch processors' scheduled delay and export timeout rely on).
+tokio = { workspace = true }
+# `http::HeaderMap` is the carrier the W3C propagator reads/writes for both
+# axum (node->envd, inbound api) and tonic (api->envd) hops; the `propagation`
+# module adapts it via `Injector`/`Extractor`. Pinned to the same major (`1`)
+# that tonic 0.12 and axum 0.7 already resolve to, so the `HeaderMap` type
+# unifies across every crate that shares trace context.
+http = "1"
+
+[dev-dependencies]
+# `serial` guards the tests that mutate process-global `OTEL_*` env vars
+# (resource-merge precedence) so they don't race each other under
+# cargo's default multi-threaded test harness.
+serial_test = "3"
+# No separate `tokio` dev-dependency: the normal dependency above pulls the full
+# workspace feature set (`macros` + `rt-multi-thread` + `time` + …), which is all
+# the tests need — the #533 quiesce regression test and the #539 isolation tests
+# drive real async-runtime batch processors on multi-thread runtimes. A dev entry
+# would only re-list features already present.
+# Re-enable `opentelemetry_sdk` with the `testing` feature for unit tests only:
+# it gates `InMemoryLogExporter`, which the log-bridge correlation test uses to
+# capture emitted records and assert their stamped trace/span IDs. Cargo unifies
+# this with the normal-dependency feature set for the test build.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
