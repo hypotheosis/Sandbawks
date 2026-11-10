@@ -36,6 +36,7 @@ export default defineConfig({
 						{ label: 'Keep sandbox files on persistent volumes', slug: 'how-to/keep-sandbox-files-on-persistent-volumes' },
 						{ label: 'Clone a sandbox', slug: 'how-to/clone-a-sandbox' },
 						{ label: 'Allow sandbox egress', slug: 'how-to/allow-sandbox-egress' },
+						{ label: 'Run sandboxes on a dedicated node pool', slug: 'how-to/run-sandboxes-on-a-dedicated-node-pool' },
 					],
 				},
 				{
