@@ -34,6 +34,7 @@ export default defineConfig({
 					items: [
 						{ label: 'Install on Kubernetes', slug: 'how-to/install-on-kubernetes' },
 						{ label: 'Keep sandbox files on persistent volumes', slug: 'how-to/keep-sandbox-files-on-persistent-volumes' },
+						{ label: 'Clone a sandbox', slug: 'how-to/clone-a-sandbox' },
 					],
 				},
 				{
